@@ -549,7 +549,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
   // inserted. There should be a function here in this file that helps you.
   // TODO: Your code here
 
-  // ***
+  rc = BtreeMoveTo(p_cursor_weak, key, local_compare_result);
 
   if (rc != ResultCode::kOk) {
     return rc;
@@ -560,7 +560,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
   // You can find the function in pager.cc
   // TODO: Your code here
 
-  // ***
+  rc = pager_->SqlitePagerWrite(p_cursor->p_page);
 
   if (rc != ResultCode::kOk) {
     return rc;
@@ -574,7 +574,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
   // cell if necessary. There is a function in B-Tree that does it.
   // TODO: Your code here
 
-  // ***
+  rc = FillInCell(new_cell);
 
   if (rc != ResultCode::kOk) {
     return rc;
@@ -595,13 +595,14 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
     // in btree.cc and one in node_page.cc
     // TODO: Your code here
 
-    // ***
+    rc = ClearCell(*cursor.p_page, cursor.cell_index);
 
     if (rc != ResultCode::kOk) {
       return rc;
     }
 
-    // ***
+    cursor.p_page->DropCell(cursor.cell_index);
+
 
     // ----------------------------------------
 
@@ -623,7 +624,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
   // There is a function in node_page.cc that helps you with this insert.
   // TODO: Your code here
 
-  // ***
+  cursor.p_page->InsertCell(new_cell, cursor.cell_index);
 
   // ----------------------------------------
 
@@ -632,7 +633,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
   // TODO: A3 -> Call Balance function
   // TODO: Your code here
 
-  // ***
+  rc = Balance(cursor.p_page, p_cursor_weak);
 
   // ----------------------------------------
 
@@ -678,7 +679,7 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
   // that the page is writable.
   // TODO: Your code here
 
-  // ***
+  rc = pager_->SqlitePagerWrite(cursor.p_page);
 
   if (rc != ResultCode::kOk) {
     return rc;
@@ -694,7 +695,7 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
   // The left child page number is stored in tha cell header
   // TODO: Your code here
 
-  // ***
+  child_page_number = cursor.p_page->GetCellHeaderByteView(cursor.cell_index).left_child;
 
   // ----------------------------------------
 
@@ -704,7 +705,7 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
   // There should be a function in this file that helps you.
   // TODO: Your code here
 
-  // ***
+  rc = ClearCell(*cursor.p_page, cursor.cell_index);
 
   if (rc != ResultCode::kOk) {
     return rc;
@@ -763,7 +764,7 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
     // There is a function in NodePage that helps you with this.
     // TODO: Your code here
 
-    // ***
+    cursor.p_page->DropCell(cursor.cell_index);
 
     // ----------------------------------------
 
@@ -783,7 +784,7 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
     // Call the balance function on the page that the cursor is pointing to.
     // TODO: Your code here
 
-    // ***
+    rc = Balance(cursor.p_page, p_cursor_weak);
 
     // ----------------------------------------
   }

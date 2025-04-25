@@ -57,7 +57,8 @@ ResultCode Btree::Balance(NodePage *p_page,
     // TODO: A3 -> Call helper function here to handle the root page
     // TODO: Your code here
 
-    // ***
+    rc = BalanceHelperHandleRoot(p_page, p_parent, p_cursor, p_extra_unref, return_ok_early);
+
 
     // ------------------------------------
 
@@ -83,7 +84,7 @@ ResultCode Btree::Balance(NodePage *p_page,
   // the current page
   // TODO: Your code here
 
-  // ***
+  idx = BalanceHelperFindChildIdx(p_page, p_parent);
 
   // ------------------------------------
 
@@ -95,7 +96,7 @@ ResultCode Btree::Balance(NodePage *p_page,
   // TODO: Your code here
   bool discovered_file_corruption;
 
-  // ***
+  discovered_file_corruption = (idx < 0);
 
   if (discovered_file_corruption) {
     return ResultCode::kCorrupt;
@@ -184,7 +185,7 @@ ResultCode Btree::Balance(NodePage *p_page,
       // k. There is a function in node_page.cc that you should call here
       // TODO: Your code here
 
-      // ***
+      left_child_page_number = p_parent->GetCellHeaderByteView(k).left_child;
 
       // ------------------------------------
 
@@ -202,7 +203,7 @@ ResultCode Btree::Balance(NodePage *p_page,
       // There is a function in node_page.cc that you should call here
       // TODO: Your code here
 
-      // ***
+      right_child_page_number = p_parent->GetNodePageHeaderByteView().right_child;
 
       // ------------------------------------
 
@@ -301,7 +302,7 @@ ResultCode Btree::Balance(NodePage *p_page,
     // iteration i? That is the value you should assign to page_number_to_free
     // TODO: Your code here
 
-    // ***
+    page_number_to_free = divider_page_numbers[i];
 
     // ------------------------------------
 
@@ -368,7 +369,7 @@ ResultCode Btree::Balance(NodePage *p_page,
     // The page number is stored in the new_page_number variable
     // TODO: Your code here
 
-    // ***
+    rc = AllocatePage(p_new_page, new_page_number);
 
     // ------------------------------------
 
@@ -395,7 +396,8 @@ ResultCode Btree::Balance(NodePage *p_page,
   // Each element in the vector is a pair of page number and NodePage pointer
   // TODO: Your code here
 
-  // ***
+  std::sort(new_page_number_to_page.begin(), new_page_number_to_page.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
 
   // ------------------------------------
 
@@ -411,8 +413,8 @@ ResultCode Btree::Balance(NodePage *p_page,
     // for iteration i
     // TODO: Your code here
 
-    // ***
-    // ***
+    new_page_number = new_page_number_to_page[i].first;
+    p_new_page = new_page_number_to_page[i].second;
 
     // -----------------------------------
 
@@ -427,8 +429,8 @@ ResultCode Btree::Balance(NodePage *p_page,
         // number of cells in p_new_page
         // TODO: Your code here
 
-        // ***
-        // ***
+        p_cursor.lock()->p_page = p_new_page;
+        p_cursor.lock()->cell_index = p_new_page->GetNumCells();
 
         // -----------------------------------
       }
@@ -438,7 +440,7 @@ ResultCode Btree::Balance(NodePage *p_page,
       // There is a function in node_page.cc that can help with this
       // TODO: Your code here
 
-      // ***
+      p_new_page->InsertCell(cell_to_insert, p_new_page->GetNumCells());
 
       // -----------------------------------
 
@@ -459,8 +461,8 @@ ResultCode Btree::Balance(NodePage *p_page,
         // divider_start_cell_idx
         // TODO: Your code here
 
-        // ***
-        // ***
+        p_cursor.lock()->p_page = p_parent;
+        p_cursor.lock()->cell_index = divider_start_cell_idx;
 
         // -----------------------------------
       }
@@ -470,7 +472,7 @@ ResultCode Btree::Balance(NodePage *p_page,
       // There should be a function in node_page.cc that can help with this
       // TODO: Your code here
 
-      // ***
+      p_parent->InsertCell(cell_to_insert, divider_start_cell_idx);
 
       // -----------------------------------
 
@@ -517,7 +519,9 @@ ResultCode Btree::Balance(NodePage *p_page,
   // The pointer to each page is stored in new_page_number_to_page
   // TODO: Your code here
 
-  // ***
+  for (auto& page_pair : new_page_number_to_page) {
+    ReParentChildPages(*page_pair.second);
+  }
 
   // ------------------------------------
 
@@ -528,7 +532,7 @@ ResultCode Btree::Balance(NodePage *p_page,
 // TODO: A3 -> Call Balance on the parent page
 // TODO: Your code here
 
-// ***
+  rc = Balance(p_parent, p_cursor);
 
 // ------------------------------------
 
@@ -603,7 +607,7 @@ Btree::BalanceHelperHandleRoot(NodePage *&p_page, NodePage *&p_parent,
     // that the root page has no right child
     // TODO: Your code here
 
-    // ***
+    root_has_right_child = (p_page->GetNodePageHeaderByteView().right_child != 0);
 
     // --------------------------
 
@@ -654,7 +658,7 @@ Btree::BalanceHelperHandleRoot(NodePage *&p_page, NodePage *&p_parent,
   // if the page that p_page points to is overfull
   // TODO: Your code here
 
-  // ***
+  root_page_is_overfull = p_page->IsOverfull();
 
   // -------------------------
 
@@ -721,7 +725,7 @@ int Btree::BalanceHelperFindChildIdx(NodePage *p_page, NodePage *p_parent) {
   // pager.cc that returns the pager number of a page
   // TODO: Your code here
 
-  // ***
+  current_page_number = pager_->SqlitePagerPageNumber(p_page);
 
   // -----------------------------
 
@@ -739,8 +743,8 @@ int Btree::BalanceHelperFindChildIdx(NodePage *p_page, NodePage *p_parent) {
     // cell header of a cell at index i.
     // TODO: Your code here
 
-    // ***
-    // ***
+    is_left_child = (p_parent->GetCellHeaderByteView(i).left_child == current_page_number);
+
 
     // -----------------------------
 
