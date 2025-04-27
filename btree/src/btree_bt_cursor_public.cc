@@ -429,12 +429,17 @@ ResultCode Btree::BtreeMoveTo(const std::weak_ptr<BtCursor> &p_cursor_weak,
         return rc;
       }
       if (c == 0) {
+        // key found
+        // CHAOS: Need to point the cursor down to leaf node when the key matches
+        // force the cursor to the leaf node where it contains
         result = c;
         cursor.compare_result = c;
         return ResultCode::kOk;
       } else if (c < 0) {
+        // key on the right
         lower_bound = cursor.cell_index + 1;
       } else {
+        // key on the left
         upper_bound = cursor.cell_index - 1;
       }
     }
@@ -548,7 +553,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
   // TODO: A3 -> Move the cursor the page and cell index where key should be
   // inserted. There should be a function here in this file that helps you.
   // TODO: Your code here
-
+  // CHAOS: force to leave node
   rc = BtreeMoveTo(p_cursor_weak, key, local_compare_result);
 
   if (rc != ResultCode::kOk) {
@@ -573,7 +578,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
   // TODO: A3 -> Call A B-Tree function to fill in the overflow pages for the
   // cell if necessary. There is a function in B-Tree that does it.
   // TODO: Your code here
-
+  // CHAOS
   rc = FillInCell(new_cell);
 
   if (rc != ResultCode::kOk) {
@@ -586,6 +591,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
     // Case 1: There is a key-data pair inside this page that matches the given
     // key Clear the cell inside this page so that we can replace it by
     // inserting it again
+    // CHAOS: NO need for left child b+ tree, maybe in balance for internal nodes
     new_cell.cell_header_.left_child =
         cursor.p_page->GetCellHeaderByteView(cursor.cell_index).left_child;
 
@@ -650,6 +656,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
  * @return
  */
 ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
+  // CHAOS: pcursor weak must be handled to point to the leave node instead of any internal node like btree
 
   // Step 1: Check if p_cursor is valid for deletion, and return error if not
   if (p_cursor_weak.expired()) {
@@ -687,6 +694,7 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
   // ----------------------------------------
 
   // Step 2: Find the child page number
+  // CHAOS: Maybe not necessary for b+ treee
   PageNumber child_page_number = 0;
 
   // TODO: A3 -> Assign the correct value to child_page_number
@@ -713,6 +721,7 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
   // ----------------------------------------
 
   // Step 4: Handle cases for internal and leaf node deletion
+  // CHAOS: Maybe will not be considered for b+ tree
   if (child_page_number != 0) {
     // Case 1: We are deleting an entry in an internal page
     // You won't need to worry about this part for the assignment.

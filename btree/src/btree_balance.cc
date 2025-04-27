@@ -56,7 +56,7 @@ ResultCode Btree::Balance(NodePage *p_page,
     bool return_ok_early = false;
     // TODO: A3 -> Call helper function here to handle the root page
     // TODO: Your code here
-
+    // CHAOS: Assume the tree has 2 levels to begin with (?)
     rc = BalanceHelperHandleRoot(p_page, p_parent, p_cursor, p_extra_unref, return_ok_early);
 
 
@@ -254,10 +254,12 @@ ResultCode Btree::Balance(NodePage *p_page,
       cursor_cell_index += divider_pages[i]->GetNumCells();
       // Note that BalanceHelperHandleRoot could have made p_page into p_parent
       // Thus, we need to check for this case
+
       if (i < divider_page_numbers.size() - 1 && cursor.p_page == p_parent &&
           cursor.cell_index == divider_cell_indexes[i]) {
         break;
       }
+      // CHAOS: Add 1 for the cell that contains data in the parent node, this is not needed in b+ tree since parent does not contain data
       ++cursor_cell_index;
     }
     p_old_page = cursor.p_page;
@@ -276,7 +278,9 @@ ResultCode Btree::Balance(NodePage *p_page,
       redistributed_cell_sizes.push_back(
           redistributed_cells.back().GetCellSize());
     }
+    // E, F
     if (i < divider_page_numbers.size() - 1) {
+      // CHAOS: This might not be needed for b+ tree
       redistributed_cells.push_back(divider_cells[i]);
       redistributed_cells.back().cell_header_.left_child =
           divider_page_headers[i].right_child;
@@ -447,6 +451,8 @@ ResultCode Btree::Balance(NodePage *p_page,
       num_cells_inserted++;
     }
     // 12 - 2: Insert cells into the parent page
+    // CHAOS: When inserting cells into parent page, when we are balancing a leaf node, make sure a copy is saved at the child layer
+    // CHAOS: This is not necessary when balancing internal node with keys
     if (i < new_page_number_to_page.size() - 1) {
       page_header = p_new_page->GetNodePageHeaderByteView();
       page_header.right_child =

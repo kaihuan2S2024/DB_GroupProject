@@ -223,3 +223,148 @@ TEST(BtreeStudentTest, CanInsertOneEntry) {
   rc = btree.BtreeCommit();
   EXPECT_EQ(rc, ResultCode::kOk);
 }
+
+
+
+TEST(BtreeStudentTest, VisualizeMultiLayerBtree) {
+  // Setup
+  std::string test_name = "VisualizeMultiLayerBtree";
+  PageNumber table_root_page_number = 0;
+  std::weak_ptr<BtCursor> p_cursor_weak;
+  BtreeStudentTest test = BtreeStudentTest(test_name);
+  bool table_is_empty = false;
+  test.SetUp();
+  ResultCode rc;
+  Btree btree(test.GetFilename(), 10);
+
+  // Begin transaction
+  rc = btree.BtreeBeginTrans();
+  EXPECT_EQ(rc, ResultCode::kOk);
+
+  // Create table
+  rc = btree.BtreeCreateTable(table_root_page_number);
+  EXPECT_EQ(rc, ResultCode::kOk);
+
+  // Create cursor with write access
+  rc = btree.BtCursorCreate(table_root_page_number, true, p_cursor_weak);
+  EXPECT_EQ(rc, ResultCode::kOk);
+
+  // Check if the table is empty
+  rc = btree.BtreeFirst(p_cursor_weak, table_is_empty);
+  EXPECT_EQ(rc, ResultCode::kOk);
+  EXPECT_TRUE(table_is_empty);
+
+  // Visualize the initial empty tree
+  // std::cout << "\nInitial empty B-tree structure:" << std::endl;
+  // std::cout << Btree::VisualizeBtreeWithExistingCursor(btree, p_cursor_weak) << std::endl;
+
+  // First, insert a sequence of ordered keys with small data to force splits
+  // and create at least three levels in the B-tree
+  const int NUM_ENTRIES = 100;
+
+  std::cout << "\nInserting " << NUM_ENTRIES << " ordered entries to create multi-layer tree..." << std::endl;
+
+  for (int i = 0; i < NUM_ENTRIES; i++) {
+    // Create key and data
+    u32 key_value = i * 10; // Use ordered keys: 0, 10, 20, 30...
+    std::vector<std::byte> key = BtreeStudentTest::UnsignedIntToByteVector(key_value);
+    std::vector<std::byte> data = BtreeStudentTest::UnsignedIntToByteVector(i + 1000);
+
+    // Insert the key-data pair
+    rc = btree.BtreeInsert(p_cursor_weak, key, data);
+    EXPECT_EQ(rc, ResultCode::kOk);
+
+  }
+
+  // Now insert some entries with large data payloads to force overflow pages
+  std::cout << "\nInserting entries with large data payloads..." << std::endl;
+
+  // Create large data (over kMaxLocalPayload size to trigger overflow pages)
+  std::vector<std::byte> large_data(600, std::byte(0xAA));
+
+  for (int i = 0; i < 10; i++) {
+    u32 key_value = 1000 + i; // Keys: 1000, 1001, 1002...
+    std::vector<std::byte> key = BtreeStudentTest::UnsignedIntToByteVector(key_value);
+
+    // Make each large data entry slightly different
+    for (size_t j = 0; j < 10; j++) {
+      large_data[j] = std::byte(i * 10 + j);
+    }
+
+    rc = btree.BtreeInsert(p_cursor_weak, key, large_data);
+    EXPECT_EQ(rc, ResultCode::kOk);
+
+    std::cout << "Inserted large entry with key " << key_value
+              << " and data size " << large_data.size() << " bytes" << std::endl;
+  }
+
+  // Move cursor to first entry for visualization
+  rc = btree.BtreeFirst(p_cursor_weak, table_is_empty);
+  EXPECT_EQ(rc, ResultCode::kOk);
+  EXPECT_FALSE(table_is_empty);
+
+  // Get and print tree depth
+
+
+  // Different visualization approaches
+
+  // // 1. Visualize the tree structure with the cursor
+  // std::cout << "\nB-Tree structure using cursor visualization:" << std::endl;
+  // std::cout << Btree::VisualizeBtreeWithExistingCursor(btree, p_cursor_weak) << std::endl;
+  //
+  // // 2. Visualize the complete tree (if available)
+  // std::cout << "\nDetailed B-Tree structure:" << std::endl;
+  // std::cout << Btree::VisualizeBtree(btree, table_root_page_number) << std::endl;
+
+  // 3. Test traversal by visiting each key in order
+  std::cout << "\nTraversing the B-Tree in order:" << std::endl;
+  rc = btree.BtreeFirst(p_cursor_weak, table_is_empty);
+  EXPECT_EQ(rc, ResultCode::kOk);
+  EXPECT_FALSE(table_is_empty);
+
+  int count = 0;
+  bool at_end = false;
+
+  while (!at_end && count < 20) { // Just show first 20 entries
+    // Get current key
+    std::vector<std::byte> key;
+    u32 key_size;
+    rc = btree.BtreeKeySize(p_cursor_weak, key_size);
+    EXPECT_EQ(rc, ResultCode::kOk);
+    btree.BtreeKey(p_cursor_weak, 0, key_size, key);
+
+    // Convert key back to u32 for display
+    u32 key_value = 0;
+    std::memcpy(&key_value, key.data(), sizeof(u32));
+
+    std::cout << "Key: " << key_value;
+
+    // Move to next entry
+    rc = btree.BtreeNext(p_cursor_weak, at_end);
+    EXPECT_EQ(rc, ResultCode::kOk);
+
+    count++;
+    if (!at_end) {
+      std::cout << " → ";
+    }
+
+    if (count % 5 == 0) {
+      std::cout << std::endl;
+    }
+  }
+
+  if (!at_end) {
+    std::cout << "... (more entries)" << std::endl;
+  }
+
+  // Clean up
+  rc = btree.BtCursorClose(p_cursor_weak);
+  EXPECT_EQ(rc, ResultCode::kOk);
+
+  rc = btree.BtreeCommit();
+  EXPECT_EQ(rc, ResultCode::kOk);
+  std::cout << "\nDetailed B-Tree structure:" << std::endl;
+  std::cout << Btree::VisualizeBtree(btree, table_root_page_number) << std::endl;
+  u32 final_depth = BtreeStudentTest::FindMaximumBtreeDepth(btree, table_root_page_number);
+  std::cout << "\nFinal B-tree depth: " << final_depth << std::endl;
+}

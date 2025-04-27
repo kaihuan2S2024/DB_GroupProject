@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <iomanip>
 #include <memory>
 #include <numeric>
 #include <queue>
@@ -230,6 +231,250 @@ class Btree {
   ResultCode BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak);
   ResultCode BtreeGetMeta(std::array<int, kMetaIntArraySize> &meta_int_arr);
   ResultCode BtreeUpdateMeta(std::array<int, kMetaIntArraySize> &meta_int_arr);
+/**
+ * @brief Helper function to visualize the structure of a B-tree with proper tree formatting
+ *
+ * This function traverses the B-tree starting from the root page and prints
+ * the structure in a hierarchical tree format, showing each node, its cells,
+ * and the relationships between nodes with ASCII art connectors.
+ *
+ * @param btree The B-tree to visualize
+ * @param root_page_number The page number of the root of the tree/table
+ * @return std::string A text representation of the B-tree structure
+ */
+static std::string VisualizeBtree(Btree& btree, PageNumber root_page_number) {
+    std::ostringstream output;
+    std::weak_ptr<BtCursor> cursor_weak;
+
+    // Create a cursor for traversal (read-only)
+    ResultCode rc = btree.BtCursorCreate(root_page_number, false, cursor_weak);
+    if (rc != ResultCode::kOk) {
+        return "Error: Could not create cursor to visualize tree.";
+    }
+
+    auto cursor = cursor_weak.lock();
+    if (!cursor) {
+        return "Error: Cursor is expired.";
+    }
+
+    // Use a DFS approach for tree visualization with proper indentation
+    output << "B-Tree Structure (root page: " << root_page_number << ")\n";
+    output << "============================================\n\n";
+
+    // Recursive helper function to visualize the tree
+    std::function<void(NodePage*, const std::string&, bool)> visualizeNodeDFS =
+        [&](NodePage* node, const std::string& prefix, bool isLast) {
+            if (!node) return;
+
+            PageNumber page_number = btree.pager_->SqlitePagerPageNumber(node);
+
+            // Print node information with tree connectors
+            output << prefix << (isLast ? "└── " : "├── ") << "Node (Page " << page_number << ")\n";
+
+            // Connectors for child elements
+            std::string childPrefix = prefix + (isLast ? "    " : "│   ");
+
+            // Process each cell in the node
+            size_t numCells = node->GetNumCells();
+            for (size_t i = 0; i < numCells; i++) {
+                CellHeaderByteView cell_header = node->GetCellHeaderByteView(i);
+                Cell cell = node->GetCell(i);
+                bool isLastCell = (i == numCells - 1);
+
+                output << childPrefix << (isLastCell && !node->GetNodePageHeaderByteView().right_child ? "└── " : "├── ")
+                       << "Cell " << i << ":\n";
+
+                std::string cellPrefix = childPrefix + (isLastCell && !node->GetNodePageHeaderByteView().right_child ? "    " : "│   ");
+
+                // Show key info
+                output << cellPrefix << "├── Key Size: " << cell_header.key_size << " bytes\n";
+
+                // If key size is 4 bytes (an integer in this case), interpret and display it
+                if (cell_header.key_size == 4 && cell.payload_.size() >= 4) {
+                    u32 key_value;
+                    std::memcpy(&key_value, cell.payload_.data(), sizeof(u32));
+                    output << cellPrefix << "├── Key Value: " << key_value << "\n";
+                }
+
+                // Show data info
+                output << cellPrefix << "├── Data Size: " << cell_header.data_size << " bytes\n";
+
+                // If data size is 4 bytes (an integer in this case), interpret and display it
+                if (cell_header.data_size == 4 && cell.payload_.size() >= cell_header.key_size + 4) {
+                    u32 data_value;
+                    std::memcpy(&data_value, cell.payload_.data() + cell_header.key_size, sizeof(u32));
+                    output << cellPrefix << "└── Data Value: " << data_value << "\n";
+                }
+
+                // Show and process left child if it exists
+                if (cell_header.left_child != 0) {
+                    BasePage* p_base_page = nullptr;
+                    rc = btree.pager_->SqlitePagerGet(cell_header.left_child,
+                                                    &p_base_page,
+                                                    NodePage::CreateDerivedPage);
+                    if (rc == ResultCode::kOk) {
+                        auto* p_child_node = dynamic_cast<NodePage*>(p_base_page);
+                        if (p_child_node) {
+                            output << cellPrefix << "└── Left Child:\n";
+                            // Recursive call to visualize the child node
+                            visualizeNodeDFS(p_child_node, cellPrefix + "    ", true);
+                            btree.pager_->SqlitePagerUnref(p_base_page);
+                        }
+                    }
+                }
+            }
+
+            // Show and process right child if it exists
+            NodePageHeaderByteView node_header = node->GetNodePageHeaderByteView();
+            if (node_header.right_child != 0) {
+                BasePage* p_base_page = nullptr;
+                rc = btree.pager_->SqlitePagerGet(node_header.right_child,
+                                                &p_base_page,
+                                                NodePage::CreateDerivedPage);
+                if (rc == ResultCode::kOk) {
+                    auto* p_child_node = dynamic_cast<NodePage*>(p_base_page);
+                    if (p_child_node) {
+                        output << childPrefix << "└── Right Child:\n";
+                        // Recursive call to visualize the child node
+                        visualizeNodeDFS(p_child_node, childPrefix + "    ", true);
+                        btree.pager_->SqlitePagerUnref(p_base_page);
+                    }
+                }
+            }
+        };
+
+    // Start the recursive visualization from the root
+    if (cursor->p_page) {
+        visualizeNodeDFS(cursor->p_page, "", true);
+    } else {
+        output << "Error: Could not access root page.\n";
+    }
+
+    // Close the cursor
+    btree.BtCursorClose(cursor_weak);
+
+    return output.str();
+}
+
+/**
+ * @brief Helper function to visualize the structure of a B-tree with existing cursor
+ *
+ * This function uses an existing cursor to visualize the B-tree with proper
+ * hierarchical structure, showing nodes, cells, and their relationships.
+ *
+ * @param btree The B-tree to visualize
+ * @param p_cursor_weak The weak pointer to an already created cursor
+ * @return std::string A text representation of the B-tree structure
+ */
+static std::string VisualizeBtreeWithExistingCursor(Btree& btree, const std::weak_ptr<BtCursor>& p_cursor_weak) {
+    std::ostringstream output;
+
+    if (p_cursor_weak.expired()) {
+        return "Error: Cursor is expired or invalid.";
+    }
+
+    auto cursor = p_cursor_weak.lock();
+    if (!cursor || !cursor->p_page) {
+        return "Error: Cursor is not pointing to a valid page.";
+    }
+
+    // Save cursor state
+    NodePage* current_page = cursor->p_page;
+    u16 current_cell_index = cursor->cell_index;
+    PageNumber root_page_number = cursor->root_page_number;
+
+    output << "B-Tree Structure (root page: " << root_page_number << ")\n";
+    output << "============================================\n\n";
+
+    // Recursive helper function to visualize the tree
+    std::function<void(NodePage*, const std::string&, bool)> visualizeNodeDFS =
+        [&](NodePage* node, const std::string& prefix, bool isLast) {
+            if (!node) return;
+
+            PageNumber page_number = btree.pager_->SqlitePagerPageNumber(node);
+
+            // Print node information with tree connectors
+            output << prefix << (isLast ? "└── " : "├── ") << "Node (Page " << page_number << ")\n";
+
+            // Connectors for child elements
+            std::string childPrefix = prefix + (isLast ? "    " : "│   ");
+
+            // Process each cell in the node
+            size_t numCells = node->GetNumCells();
+            for (size_t i = 0; i < numCells; i++) {
+                CellHeaderByteView cell_header = node->GetCellHeaderByteView(i);
+                Cell cell = node->GetCell(i);
+                bool isLastCell = (i == numCells - 1);
+
+                output << childPrefix << (isLastCell && !node->GetNodePageHeaderByteView().right_child ? "└── " : "├── ")
+                       << "Cell " << i << ":\n";
+
+                std::string cellPrefix = childPrefix + (isLastCell && !node->GetNodePageHeaderByteView().right_child ? "    " : "│   ");
+
+                // Show key info
+                output << cellPrefix << "├── Key Size: " << cell_header.key_size << " bytes\n";
+
+                // If key size is 4 bytes (an integer in this case), interpret and display it
+                if (cell_header.key_size == 4 && cell.payload_.size() >= 4) {
+                    u32 key_value;
+                    std::memcpy(&key_value, cell.payload_.data(), sizeof(u32));
+                    output << cellPrefix << "├── Key Value: " << key_value << "\n";
+                }
+
+                // Show data info
+                output << cellPrefix << "├── Data Size: " << cell_header.data_size << " bytes\n";
+
+                // If data size is 4 bytes (an integer in this case), interpret and display it
+                if (cell_header.data_size == 4 && cell.payload_.size() >= cell_header.key_size + 4) {
+                    u32 data_value;
+                    std::memcpy(&data_value, cell.payload_.data() + cell_header.key_size, sizeof(u32));
+                    output << cellPrefix << "└── Data Value: " << data_value << "\n";
+                } else {
+                    output << cellPrefix << "└── Data: " << cell_header.data_size << " bytes\n";
+                }
+
+                // Show and process left child if it exists
+                if (cell_header.left_child != 0) {
+                    BasePage* p_base_page = nullptr;
+                    ResultCode rc = btree.pager_->SqlitePagerGet(cell_header.left_child,
+                                                    &p_base_page,
+                                                    NodePage::CreateDerivedPage);
+                    if (rc == ResultCode::kOk) {
+                        auto* p_child_node = dynamic_cast<NodePage*>(p_base_page);
+                        if (p_child_node) {
+                            output << cellPrefix << "└── Left Child:\n";
+                            // Recursive call to visualize the child node
+                            visualizeNodeDFS(p_child_node, cellPrefix + "    ", true);
+                            btree.pager_->SqlitePagerUnref(p_base_page);
+                        }
+                    }
+                }
+            }
+
+            // Show and process right child if it exists
+            NodePageHeaderByteView node_header = node->GetNodePageHeaderByteView();
+            if (node_header.right_child != 0) {
+                BasePage* p_base_page = nullptr;
+                ResultCode rc = btree.pager_->SqlitePagerGet(node_header.right_child,
+                                                &p_base_page,
+                                                NodePage::CreateDerivedPage);
+                if (rc == ResultCode::kOk) {
+                    auto* p_child_node = dynamic_cast<NodePage*>(p_base_page);
+                    if (p_child_node) {
+                        output << childPrefix << "└── Right Child:\n";
+                        // Recursive call to visualize the child node
+                        visualizeNodeDFS(p_child_node, childPrefix + "    ", true);
+                        btree.pager_->SqlitePagerUnref(p_base_page);
+                    }
+                }
+            }
+        };
+
+    // Start the recursive visualization from the current page
+    visualizeNodeDFS(cursor->p_page, "", true);
+
+    return output.str();
+}
 };
 
 // Created for testing purposes to make it easier possible to test the Btree
