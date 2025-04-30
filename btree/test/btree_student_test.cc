@@ -477,3 +477,308 @@ TEST(BtreeStudentTest, InsertAndVisualizeStringKey) {
   std::cout << "\nB-Tree structure with string keys:" << std::endl;
   std::cout << Btree::VisualizeBtree(btree, table_root_page_number) << std::endl;
 }
+
+TEST(BtreeStudentTest, TestBtreeSearch) {
+  // Setup
+  std::string test_name = "TestBtreeSearch";
+  PageNumber table_root_page_number = 0;
+  std::weak_ptr<BtCursor> p_cursor_weak;
+  BtreeStudentTest test = BtreeStudentTest(test_name);
+  test.SetUp();
+  ResultCode rc;
+  Btree btree(test.GetFilename(), 10);
+
+  // Begin transaction and create table
+  rc = btree.BtreeBeginTrans();
+  EXPECT_EQ(rc, ResultCode::kOk);
+  rc = btree.BtreeCreateTable(table_root_page_number);
+  EXPECT_EQ(rc, ResultCode::kOk);
+
+  // Create cursor
+  rc = btree.BtCursorCreate(table_root_page_number, true, p_cursor_weak);
+  EXPECT_EQ(rc, ResultCode::kOk);
+
+  // Insert several entries with different keys and values
+  const int NUM_ENTRIES = 10;
+  for (int i = 0; i < NUM_ENTRIES; i++) {
+    u32 key_value = i * 10; // Keys: 0, 10, 20, 30...
+    u32 data_value = i * 100 + 5; // Data: 5, 105, 205, 305...
+
+    std::vector<std::byte> key = BtreeStudentTest::UnsignedIntToByteVector(key_value);
+    std::vector<std::byte> data = BtreeStudentTest::UnsignedIntToByteVector(data_value);
+
+    rc = btree.BtreeInsert(p_cursor_weak, key, data);
+    EXPECT_EQ(rc, ResultCode::kOk);
+  }
+
+  // Test 1: Search for existing key
+  {
+    u32 search_key_value = 30; // This should exist
+    std::vector<std::byte> search_key = BtreeStudentTest::UnsignedIntToByteVector(search_key_value);
+    int result;
+    std::vector<std::byte> found_data = btree.BtreeSearch(p_cursor_weak, search_key, result);
+
+    // Verify the result
+    EXPECT_EQ(result, 0); // 0 means hit
+    EXPECT_FALSE(found_data.empty());
+
+    // Convert the data back to an integer and verify
+    u32 retrieved_data_value;
+    std::memcpy(&retrieved_data_value, found_data.data(), sizeof(u32));
+    EXPECT_EQ(retrieved_data_value, 305); // Should be 3 * 100 + 5
+  }
+
+  // Test 2: Search for non-existing key
+  {
+    u32 search_key_value = 25; // This doesn't exist
+    std::vector<std::byte> search_key = BtreeStudentTest::UnsignedIntToByteVector(search_key_value);
+    int result;
+    std::vector<std::byte> found_data = btree.BtreeSearch(p_cursor_weak, search_key, result);
+
+    // Verify the result
+    EXPECT_EQ(result, 1); // 1 means miss
+    EXPECT_TRUE(found_data.empty());
+  }
+
+  // Test 3: Search at beginning of tree
+  {
+    u32 search_key_value = 0; // First entry
+    std::vector<std::byte> search_key = BtreeStudentTest::UnsignedIntToByteVector(search_key_value);
+    int result;
+    std::vector<std::byte> found_data = btree.BtreeSearch(p_cursor_weak, search_key, result);
+
+    EXPECT_EQ(result, 0); // 0 means hit
+    EXPECT_FALSE(found_data.empty());
+
+    u32 retrieved_data_value;
+    std::memcpy(&retrieved_data_value, found_data.data(), sizeof(u32));
+    EXPECT_EQ(retrieved_data_value, 5); // Should be 0 * 100 + 5
+  }
+
+  // Test 4: Search at end of tree
+  {
+    u32 search_key_value = 90; // Last entry
+    std::vector<std::byte> search_key = BtreeStudentTest::UnsignedIntToByteVector(search_key_value);
+    int result;
+    std::vector<std::byte> found_data = btree.BtreeSearch(p_cursor_weak, search_key, result);
+
+    EXPECT_EQ(result, 0); // 0 means hit
+    EXPECT_FALSE(found_data.empty());
+
+    u32 retrieved_data_value;
+    std::memcpy(&retrieved_data_value, found_data.data(), sizeof(u32));
+    EXPECT_EQ(retrieved_data_value, 905); // Should be 9 * 100 + 5
+  }
+
+  // Test 5: Search after deletion
+  {
+    // Delete an entry
+    u32 delete_key_value = 50;
+    std::vector<std::byte> delete_key = BtreeStudentTest::UnsignedIntToByteVector(delete_key_value);
+    int compare_result;
+    rc = btree.BtreeMoveTo(p_cursor_weak, delete_key, compare_result);
+    EXPECT_EQ(rc, ResultCode::kOk);
+    EXPECT_EQ(compare_result, 0);
+
+    rc = btree.BtreeDelete(p_cursor_weak);
+    EXPECT_EQ(rc, ResultCode::kOk);
+
+    // Now search for the deleted key
+    int result;
+    std::vector<std::byte> found_data = btree.BtreeSearch(p_cursor_weak, delete_key, result);
+
+    EXPECT_EQ(result, 1); // 1 means miss
+    EXPECT_TRUE(found_data.empty());
+  }
+
+  // Clean up
+  rc = btree.BtCursorClose(p_cursor_weak);
+  EXPECT_EQ(rc, ResultCode::kOk);
+  rc = btree.BtreeCommit();
+  EXPECT_EQ(rc, ResultCode::kOk);
+}
+
+TEST(BtreeStudentTest, TestBtreeRangeSearch) {
+  // Setup
+  std::string test_name = "TestBtreeRangeSearch";
+  PageNumber table_root_page_number = 0;
+  std::weak_ptr<BtCursor> p_cursor_weak;
+  BtreeStudentTest test = BtreeStudentTest(test_name);
+  test.SetUp();
+  ResultCode rc;
+  Btree btree(test.GetFilename(), 10);
+
+  // Begin transaction and create table
+  rc = btree.BtreeBeginTrans();
+  EXPECT_EQ(rc, ResultCode::kOk);
+  rc = btree.BtreeCreateTable(table_root_page_number);
+  EXPECT_EQ(rc, ResultCode::kOk);
+
+  // Create cursor
+  rc = btree.BtCursorCreate(table_root_page_number, true, p_cursor_weak);
+  EXPECT_EQ(rc, ResultCode::kOk);
+
+  // Insert a sequence of entries with different keys and values
+  const int NUM_ENTRIES = 20;
+  for (int i = 0; i < NUM_ENTRIES; i++) {
+    u32 key_value = i * 5; // Keys: 0, 5, 10, 15...
+    u32 data_value = 1000 + i; // Data: 1000, 1001, 1002...
+
+    std::vector<std::byte> key = BtreeStudentTest::UnsignedIntToByteVector(key_value);
+    std::vector<std::byte> data = BtreeStudentTest::UnsignedIntToByteVector(data_value);
+
+    rc = btree.BtreeInsert(p_cursor_weak, key, data);
+    EXPECT_EQ(rc, ResultCode::kOk);
+  }
+
+  // Test 1: Range search with exact start and end keys
+  {
+    u32 start_key_value = 15;
+    u32 end_key_value = 40;
+    std::vector<std::byte> start_key = BtreeStudentTest::UnsignedIntToByteVector(start_key_value);
+    std::vector<std::byte> end_key = BtreeStudentTest::UnsignedIntToByteVector(end_key_value);
+
+    int result;
+    std::vector<std::vector<std::byte>> range_data =
+        btree.BtreeRangeSearch(p_cursor_weak, start_key, end_key, result);
+
+    // Verify the result
+    EXPECT_EQ(result, 0); // 0 means hit on start key
+    EXPECT_EQ(range_data.size(), 6); // Should find 6 entries: 15, 20, 25, 30, 35, 40
+
+    // Check the first and last entries
+    if (!range_data.empty()) {
+      u32 first_data_value;
+      std::memcpy(&first_data_value, range_data.front().data(), sizeof(u32));
+      EXPECT_EQ(first_data_value, 1003); // 15/5 = 3, so 1000 + 3
+
+      u32 last_data_value;
+      std::memcpy(&last_data_value, range_data.back().data(), sizeof(u32));
+      EXPECT_EQ(last_data_value, 1008); // 40/5 = 8, so 1000 + 8
+    }
+  }
+
+  // Test 2: Range search with start key not found (but within range)
+  {
+    u32 start_key_value = 17; // Not in tree
+    u32 end_key_value = 30;
+    std::vector<std::byte> start_key = BtreeStudentTest::UnsignedIntToByteVector(start_key_value);
+    std::vector<std::byte> end_key = BtreeStudentTest::UnsignedIntToByteVector(end_key_value);
+
+    int result;
+    std::vector<std::vector<std::byte>> range_data =
+        btree.BtreeRangeSearch(p_cursor_weak, start_key, end_key, result);
+
+    // Verify the result
+    EXPECT_EQ(result, 1); // 1 means miss on start key
+    EXPECT_EQ(range_data.size(), 3); // Should find 3 entries: 20, 25, 30
+
+    // Check the first entry
+    if (!range_data.empty()) {
+      u32 first_data_value;
+      std::memcpy(&first_data_value, range_data.front().data(), sizeof(u32));
+      EXPECT_EQ(first_data_value, 1004); // 20/5 = 4, so 1000 + 4
+    }
+  }
+
+  // Test 4: Range search entire tree
+  {
+    u32 start_key_value = 0;
+    u32 end_key_value = 95; // Last key is 95
+    std::vector<std::byte> start_key = BtreeStudentTest::UnsignedIntToByteVector(start_key_value);
+    std::vector<std::byte> end_key = BtreeStudentTest::UnsignedIntToByteVector(end_key_value);
+
+    int result;
+    std::vector<std::vector<std::byte>> range_data =
+        btree.BtreeRangeSearch(p_cursor_weak, start_key, end_key, result);
+
+    EXPECT_EQ(result, 0); // 0 means hit on start key
+    EXPECT_EQ(range_data.size(), NUM_ENTRIES); // Should find all entries
+
+    // Check first, middle and last entries
+    if (range_data.size() == NUM_ENTRIES) {
+      u32 first_data_value, middle_data_value, last_data_value;
+      std::memcpy(&first_data_value, range_data.front().data(), sizeof(u32));
+      std::memcpy(&middle_data_value, range_data[NUM_ENTRIES/2].data(), sizeof(u32));
+      std::memcpy(&last_data_value, range_data.back().data(), sizeof(u32));
+
+      EXPECT_EQ(first_data_value, 1000);
+      EXPECT_EQ(middle_data_value, 1000 + NUM_ENTRIES/2);
+      EXPECT_EQ(last_data_value, 1000 + NUM_ENTRIES - 1);
+    }
+  }
+
+  // Test 5: Range search with both keys not in tree
+  {
+    u32 start_key_value = 22; // Not in tree
+    u32 end_key_value = 38; // Not in tree
+    std::vector<std::byte> start_key = BtreeStudentTest::UnsignedIntToByteVector(start_key_value);
+    std::vector<std::byte> end_key = BtreeStudentTest::UnsignedIntToByteVector(end_key_value);
+
+    int result;
+    std::vector<std::vector<std::byte>> range_data =
+        btree.BtreeRangeSearch(p_cursor_weak, start_key, end_key, result);
+
+    EXPECT_EQ(result, 1); // 1 means miss on start key
+    EXPECT_EQ(range_data.size(), 3); // Should find 3 entries: 25, 30, 35
+
+    // Check the entries
+    if (range_data.size() == 3) {
+      u32 data_values[3];
+      for (int i = 0; i < 3; i++) {
+        std::memcpy(&data_values[i], range_data[i].data(), sizeof(u32));
+      }
+
+      EXPECT_EQ(data_values[0], 1005); // 25/5 = 5, so 1000 + 5
+      EXPECT_EQ(data_values[1], 1006); // 30/5 = 6, so 1000 + 6
+      EXPECT_EQ(data_values[2], 1007); // 35/5 = 7, so 1000 + 7
+    }
+  }
+
+  // Test 6: Range search after deletion
+  {
+    // Delete a range of entries
+    for (int i = 4; i <= 6; i++) { // Delete keys 20, 25, 30
+      u32 delete_key_value = i * 5;
+      std::vector<std::byte> delete_key = BtreeStudentTest::UnsignedIntToByteVector(delete_key_value);
+      int compare_result;
+      rc = btree.BtreeMoveTo(p_cursor_weak, delete_key, compare_result);
+      EXPECT_EQ(rc, ResultCode::kOk);
+      EXPECT_EQ(compare_result, 0);
+
+      rc = btree.BtreeDelete(p_cursor_weak);
+      EXPECT_EQ(rc, ResultCode::kOk);
+    }
+
+    // Now search for a range that includes the deleted entries
+    u32 start_key_value = 15;
+    u32 end_key_value = 35;
+    std::vector<std::byte> start_key = BtreeStudentTest::UnsignedIntToByteVector(start_key_value);
+    std::vector<std::byte> end_key = BtreeStudentTest::UnsignedIntToByteVector(end_key_value);
+
+    int result;
+    std::vector<std::vector<std::byte>> range_data =
+        btree.BtreeRangeSearch(p_cursor_weak, start_key, end_key, result);
+
+    EXPECT_EQ(result, 0); // 0 means hit on start key
+    EXPECT_EQ(range_data.size(), 2); // Should find only 2 entries: 15, 35
+
+    // Check the entries
+    if (range_data.size() == 2) {
+      u32 first_data_value, second_data_value;
+      std::memcpy(&first_data_value, range_data[0].data(), sizeof(u32));
+      std::memcpy(&second_data_value, range_data[1].data(), sizeof(u32));
+
+      EXPECT_EQ(first_data_value, 1003); // 15/5 = 3, so 1000 + 3
+      EXPECT_EQ(second_data_value, 1007); // 35/5 = 7, so 1000 + 7
+    }
+  }
+
+  // Clean up
+  rc = btree.BtCursorClose(p_cursor_weak);
+  EXPECT_EQ(rc, ResultCode::kOk);
+  rc = btree.BtreeCommit();
+  EXPECT_EQ(rc, ResultCode::kOk);
+
+  std::cout << Btree::VisualizeBtree(btree, table_root_page_number) << std::endl;
+}

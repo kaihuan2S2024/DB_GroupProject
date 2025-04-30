@@ -599,6 +599,44 @@ ResultCode Btree::BtreeNext(const std::weak_ptr<BtCursor> &p_cursor_weak,
   return ResultCode::kOk;
 }
 
+ResultCode Btree::BtreeLinkedListNext(const std::weak_ptr<BtCursor> &p_cursor_weak,
+                            bool &already_at_last_entry) {
+  if (p_cursor_weak.expired()) {
+    return ResultCode::kError;
+  }
+  auto p_cursor = p_cursor_weak.lock();
+  if (bt_cursor_set_.find(p_cursor) == bt_cursor_set_.end()) {
+    return ResultCode::kError;
+  }
+  auto &cursor = *p_cursor;
+  if (!cursor.p_page) {
+    return ResultCode::kAbort;
+  }
+
+  if (cursor.cell_index < cursor.p_page->GetNumCells()) {
+    cursor.cell_index++;
+    already_at_last_entry = false;
+    return ResultCode::kOk;
+  } else {
+    PageNumber next_page_number = p_cursor->p_page->GetNodePageHeaderByteView().right_child;
+    if (next_page_number == 0) {
+      already_at_last_entry = true;
+      return ResultCode::kOk;
+    } else {
+      BasePage *p_base_page = nullptr;
+      ResultCode rc = pager_->SqlitePagerGet(next_page_number, &p_base_page, NodePage::CreateDerivedPage);
+      if (rc != ResultCode::kOk) {
+        return rc;
+      }
+      cursor.p_page = dynamic_cast<NodePage *>(p_base_page);
+      cursor.cell_index = 0;
+
+      already_at_last_entry = false;
+      return ResultCode::kOk;
+    }
+  }
+}
+
 ResultCode Btree::BTreePrev(const std::weak_ptr<BtCursor> &p_cursor_weak) {
   if (p_cursor_weak.expired()) {
     return ResultCode::kError;
@@ -999,4 +1037,200 @@ Btree::BtreeGetNodeDepth(const std::weak_ptr<BtCursor> &p_cursor_weak,
     depth++;
   }
   return ResultCode::kOk;
+}
+
+/*
+ * Result = 0, Hit
+ * Result = 1, Miss
+ * Result = -1, Error
+ */
+std::vector<std::byte> Btree::BtreeSearch(const std::weak_ptr<BtCursor> &p_cursor_weak,
+                              std::vector<std::byte> &key, int &result) {
+  ResultCode rc;
+  rc = BtreeMoveTo(p_cursor_weak, key, result);
+  if (rc != ResultCode::kOk) {
+    result = -1;
+    return {};
+  }
+
+  if (result == 0) { // Hit
+    if (p_cursor_weak.expired()) {
+      result = -1;
+      return {};
+    }
+    auto p_cursor = p_cursor_weak.lock();
+    if (bt_cursor_set_.find(p_cursor) == bt_cursor_set_.end()) {
+      result = -1;
+      return {};
+    }
+    auto &cursor = *p_cursor;
+    if (!cursor.p_page) {
+      result = -1;
+      return {};
+    }
+
+    Cell target_cell = cursor.p_page->GetCell(cursor.cell_index);
+    std::vector<std::byte> target_data(target_cell.cell_header_.data_size);
+    std::memcpy(target_data.data(), target_cell.payload_.data() + target_cell.cell_header_.key_size, target_cell.cell_header_.data_size);
+
+    result = 0;
+    return target_data;
+
+  } else { // Miss
+    result = 1;
+    return {};
+  }
+
+}
+
+
+/*
+ * Result = 0, Hit
+ * Result = 1, Miss
+ * Result = -1, Error
+ */
+std::vector<std::vector<std::byte>> Btree::BtreeRangeSearch(const std::weak_ptr<BtCursor> &p_cursor_weak,
+                              std::vector<std::byte> &key_start, std::vector<std::byte> &key_end,int &result) {
+  ResultCode rc;
+  rc = BtreeMoveTo(p_cursor_weak, key_start, result);
+  if (rc != ResultCode::kOk) {
+    result = -1;
+    return {};
+  }
+
+  if (result == 0) { // Hit
+    if (p_cursor_weak.expired()) {
+      result = -1;
+      return {};
+    }
+    auto p_cursor = p_cursor_weak.lock();
+    if (bt_cursor_set_.find(p_cursor) == bt_cursor_set_.end()) {
+      result = -1;
+      return {};
+    }
+    auto &cursor = *p_cursor;
+    if (!cursor.p_page) {
+      result = -1;
+      return {};
+    }
+
+    std::vector<std::vector<std::byte>> target_data_vector;
+    bool already_at_last_entry;
+    int compare_result;
+
+    // Process entries until we reach the end or exceed key_end
+    do {
+      // Make sure we have a valid cell before trying to access it
+      if (cursor.cell_index < cursor.p_page->GetNumCells()) {
+        Cell target_cell = cursor.p_page->GetCell(cursor.cell_index);
+
+        // Only add non-empty data
+        if (target_cell.cell_header_.data_size > 0) {
+          std::vector<std::byte> target_data(target_cell.cell_header_.data_size);
+          std::memcpy(target_data.data(),
+                     target_cell.payload_.data() + target_cell.cell_header_.key_size,
+                     target_cell.cell_header_.data_size);
+          target_data_vector.push_back(target_data);
+        }
+      }
+
+      // Move to next entry
+      rc = BtreeLinkedListNext(p_cursor_weak, already_at_last_entry);
+      if (rc != ResultCode::kOk || already_at_last_entry) {
+        break; // Exit if we're at the last entry or encounter an error
+      }
+
+      // Compare with end key only if we're not at the last entry
+      rc = BtreeKeyCompare(p_cursor_weak, key_end, 0, compare_result);
+      if (rc != ResultCode::kOk) {
+        break;
+      }
+    } while (compare_result <= 0); // Exit when key > key_end
+
+    result = 0;
+    return target_data_vector;
+
+  } else { // Miss
+    // We didn't find an exact match for key_start
+    if (p_cursor_weak.expired()) {
+        result = -1;
+        return {};
+    }
+    auto p_cursor = p_cursor_weak.lock();
+    if (bt_cursor_set_.find(p_cursor) == bt_cursor_set_.end()) {
+        result = -1;
+        return {};
+    }
+    auto &cursor = *p_cursor;
+    if (!cursor.p_page) {
+        result = -1;
+        return {};
+    }
+
+    std::vector<std::vector<std::byte>> target_data_vector;
+    bool already_at_last_entry;
+    int compare_result;
+
+    // Check if the cursor is pointing to a key less than key_start
+    if (result < 0) {
+        // Cursor is pointing to a key less than key_start
+        // We need to move to the next entry that's >= key_start
+        rc = BtreeNext(p_cursor_weak, already_at_last_entry);
+
+        // Error case
+        if (rc != ResultCode::kOk) {
+            result = -1;
+            return {};
+        }
+        // Last Cell case
+        if (already_at_last_entry) {
+          result = 1;
+          return {};
+        }
+    }
+
+    // At this point, cursor should be at the first entry >= key_start
+    // Now check if this entry is <= key_end
+    rc = BtreeKeyCompare(p_cursor_weak, key_end, 0, compare_result);
+    if (rc != ResultCode::kOk) {
+        result = -1;
+        return {};
+    }
+
+    // If cursor is pointing to a key greater than key_end, return empty result
+    if (compare_result > 0) {
+        result = 1;
+        return {};
+    }
+
+    // Process all entries between key_start and key_end
+    do {
+        Cell target_cell = cursor.p_page->GetCell(cursor.cell_index);
+        std::vector<std::byte> target_data(target_cell.cell_header_.data_size);
+        std::memcpy(target_data.data(),
+                   target_cell.payload_.data() + target_cell.cell_header_.key_size,
+                   target_cell.cell_header_.data_size);
+        target_data_vector.push_back(target_data);
+
+        rc = BtreeLinkedListNext(p_cursor_weak, already_at_last_entry);
+        if (rc != ResultCode::kOk) {
+            result = -1;
+            return {};
+        }
+
+        // Check if we've gone past key_end
+        if (!already_at_last_entry) {
+            rc = BtreeKeyCompare(p_cursor_weak, key_end, 0, compare_result);
+            if (rc != ResultCode::kOk) {
+                result = -1;
+                return {};
+            }
+        }
+        // Continue until we reach the end or exceed key_end
+    } while (!already_at_last_entry && compare_result <= 0);
+
+    // We did find results, but they weren't exact matches for key_start
+    result = 1;
+    return target_data_vector;
+  }
 }

@@ -289,6 +289,8 @@ class Btree {
                                  std::vector<std::byte> &key, int &result);
   ResultCode BtreeNext(const std::weak_ptr<BtCursor> &p_cursor_weak,
                        bool &already_at_last_entry);
+  ResultCode BtreeLinkedListNext(const std::weak_ptr<BtCursor> &p_cursor_weak,
+                                 bool &already_at_last_entry);
   ResultCode BTreePrev(const std::weak_ptr<BtCursor> &p_cursor_weak);
   ResultCode BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
                          std::vector<std::byte> &key,
@@ -296,6 +298,13 @@ class Btree {
 
   ResultCode BtreeGetNodeDepth(const std::weak_ptr<BtCursor> &p_cursor_weak,
                                u32 &depth);
+  std::vector<std::byte> BtreeSearch(
+      const std::weak_ptr<BtCursor> &p_cursor_weak, std::vector<std::byte> &key,
+      int &result);
+  std::vector<std::vector<std::byte>> BtreeRangeSearch(
+      const std::weak_ptr<BtCursor> &p_cursor_weak,
+      std::vector<std::byte> &key_start, std::vector<std::byte> &key_end,
+      int &result);
 
   ResultCode BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak);
   ResultCode BtreeGetMeta(std::array<int, kMetaIntArraySize> &meta_int_arr);
