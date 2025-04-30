@@ -118,6 +118,7 @@ ResultCode Btree::UnlockBtreeIfUnused() {
   return ResultCode::kOk;
 }
 
+// CHAOS: Do we need to modify this???
 ResultCode Btree::InitPage(NodePage &node_page, NodePage *p_parent) {
   if (node_page.p_parent_) {
     if (node_page.p_parent_ != p_parent) {
@@ -242,6 +243,7 @@ ResultCode Btree::AllocatePage(NodePage *&p_node_page,
       p_node_page = dynamic_cast<NodePage *>(p_base_page);
     }
   }
+
   return rc;
 }
 
@@ -454,57 +456,88 @@ void Btree::ReParentPage(PageNumber page_number, NodePage *p_new_parent) {
   pager_->SqlitePagerUnref(p_base_page);
 }
 
+// CHAOS: add leaf node check
 void Btree::ReParentChildPages(NodePage &node_page) {
-  for (u16 cell_idx = 0; cell_idx < node_page.cell_trackers_.size();
-       ++cell_idx) {
-    CellHeaderByteView cell_header = node_page.GetCellHeaderByteView(cell_idx);
-    ReParentPage(cell_header.left_child, &node_page);
+  // Only internal nodes have child pages that need to be re-parented
+  if (node_page.IsInternalNode()) {
+    for (u16 cell_idx = 0; cell_idx < node_page.cell_trackers_.size();
+         ++cell_idx) {
+      CellHeaderByteView cell_header = node_page.GetCellHeaderByteView(cell_idx);
+      ReParentPage(cell_header.left_child, &node_page);
+         }
+    ReParentPage(node_page.GetNodePageHeaderByteView().right_child, &node_page);
   }
-  ReParentPage(node_page.GetNodePageHeaderByteView().right_child, &node_page);
+  // For leaf nodes, no need to re-parent as they don't have child nodes
 }
 
+// CHAOS: modify to handle leaf node don't have right_child
 ResultCode Btree::ClearDatabasePage(PageNumber page_number, bool free_page) {
   BasePage *p_base_page = nullptr;
   NodePage *p_node_page = nullptr;
   ResultCode rc;
+
   rc = pager_->SqlitePagerGet(page_number, &p_base_page,
-                              NodePage::CreateDerivedPage);
+                             NodePage::CreateDerivedPage);
   if (rc != ResultCode::kOk) {
     return rc;
   }
+
   rc = pager_->SqlitePagerWrite(p_base_page);
   if (rc != ResultCode::kOk) {
     return rc;
   }
+
   p_node_page = dynamic_cast<NodePage *>(p_base_page);
   NodePageHeaderByteView node_page_header =
       p_node_page->GetNodePageHeaderByteView();
-  for (u16 cell_idx = 0; cell_idx < p_node_page->cell_trackers_.size();
-       ++cell_idx) {
-    CellHeaderByteView cell_header =
-        p_node_page->GetCellHeaderByteView(cell_idx);
-    if (cell_header.left_child != 0) {
-      rc = ClearDatabasePage(cell_header.left_child, true);
+
+  // For B+ tree, only internal nodes need to traverse child pointers
+  if (p_node_page->IsInternalNode()) {
+    for (u16 cell_idx = 0; cell_idx < p_node_page->cell_trackers_.size();
+         ++cell_idx) {
+      CellHeaderByteView cell_header =
+          p_node_page->GetCellHeaderByteView(cell_idx);
+
+      if (cell_header.left_child != 0) {
+        rc = ClearDatabasePage(cell_header.left_child, true);
+        if (rc != ResultCode::kOk) {
+          return rc;
+        }
+      }
+
+      // For internal nodes, we don't need to clear cell data,
+      // only child pointers
+      if (!p_node_page->IsInternalNode()) {
+        rc = ClearCell(*p_node_page, cell_idx);
+        if (rc != ResultCode::kOk) {
+          return rc;
+        }
+      }
+    }
+
+    if (node_page_header.right_child != 0) {
+      rc = ClearDatabasePage(node_page_header.right_child, true);
       if (rc != ResultCode::kOk) {
         return rc;
       }
     }
-    rc = ClearCell(*p_node_page, cell_idx);
-    if (rc != ResultCode::kOk) {
-      return rc;
+  } else {
+    // For leaf nodes, we need to clear all cells but not traverse child pointers
+    for (u16 cell_idx = 0; cell_idx < p_node_page->cell_trackers_.size();
+         ++cell_idx) {
+      rc = ClearCell(*p_node_page, cell_idx);
+      if (rc != ResultCode::kOk) {
+        return rc;
+      }
     }
   }
-  if (node_page_header.right_child != 0) {
-    rc = ClearDatabasePage(node_page_header.right_child, true);
-    if (rc != ResultCode::kOk) {
-      return rc;
-    }
-  }
+
   if (free_page) {
     rc = FreePage(p_base_page, page_number, false);
   } else {
     p_node_page->ZeroPage();
   }
+
   rc = pager_->SqlitePagerUnref(p_base_page);
   return rc;
 }

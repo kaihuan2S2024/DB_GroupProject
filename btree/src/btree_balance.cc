@@ -10,17 +10,142 @@
 #include "btree.h"
 
 /**
- * Balance is usually called from after inserting a cell into leaf node, where
- * p_page is the leaf node. The function is called recursively upwards towards
- * the parent, where p_page becomes the parent node. Eventually, the recursive
- * call will reach the root node, and the Balance function will stop.
+ * Structure to hold all the context needed during a balance operation.
+ * This avoids passing too many parameters between methods.
+ */
+struct BalanceContext {
+  NodePage *p_parent;
+  std::vector<NodePage *> divider_pages;
+  std::vector<u16> num_cells_in_divider_pages;
+  std::vector<PageNumber> divider_page_numbers;
+  std::vector<u16> divider_cell_indexes;
+  std::vector<Cell> divider_cells;
+  std::vector<Cell> redistributed_cells;
+  std::vector<u16> new_divider_cell_indexes;
+  u16 cursor_cell_index;
+  std::vector<u32> redistributed_cell_sizes;
+  u32 num_cells_inserted;
+  std::vector<u32> new_combined_cell_sizes;
+  std::vector<std::pair<PageNumber, NodePage *>> new_page_number_to_page;
+  PageNumber final_right_child;
+  int divider_start_cell_idx;
+};
+
+ResultCode Btree::BalanceLeafNode(NodePage *p_page, const std::weak_ptr<BtCursor> &p_cursor) {
+  ResultCode rc;
+  NodePage *p_parent = p_page->p_parent_;
+  BasePage *p_base_page = nullptr;
+  NodePage *p_extra_unref = nullptr;
+
+  // Step 4: Find the index of the cell in the parent that points to the current page
+  int idx = BalanceHelperFindChildIdx(p_page, p_parent);
+
+  // Check for file corruption
+  bool discovered_file_corruption = (idx < 0);
+  if (discovered_file_corruption) {
+    return ResultCode::kCorrupt;
+  }
+
+  // Step 5-7: Collect divider pages, cells, and prepare for redistribution
+  BalanceContext context;
+  rc = InitializeBalanceContext(context, p_page, p_parent, p_cursor, idx, false);
+  if (rc != ResultCode::kOk) {
+    goto balance_cleanup;
+  }
+
+  // Step 8-9: Calculate and distribute cell sizes for the new pages
+  CalculateNewPageDistribution(context);
+
+  // Step 10: Allocate new pages for the cells
+  rc = AllocateNewPages(context, false);
+  if (rc != ResultCode::kOk) {
+    goto balance_cleanup;
+  }
+
+  // Step 11: Sort the new pages by page number
+  SortNewPagesByNumber(context);
+
+  // Step 12: Insert the cells into the new pages and update the cursor
+  rc = RedistributeCells(context, p_cursor, false);
+  if (rc != ResultCode::kOk) {
+    goto balance_cleanup;
+  }
+
+  // Step 13: Re-parent the child pages
+  ReParentAllPages(context);
+
+  // Step 14: Call Balance on the parent page
+  rc = Balance(p_parent, p_cursor);
+
+  // Step 15: Cleanup
+balance_cleanup:
+  CleanupBalanceOperation(context, p_extra_unref, p_parent, p_cursor);
+  return rc;
+
+
+
+
+}
+
+ResultCode Btree::BalanceInternalNode(NodePage *p_page,
+                          const std::weak_ptr<BtCursor> &p_cursor) {
+  ResultCode rc;
+  NodePage *p_parent = p_page->p_parent_;
+  BasePage *p_base_page = nullptr;
+  NodePage *p_extra_unref = nullptr;
+
+  // Step 4: Find the index of the cell in the parent that points to the current page
+  int idx = BalanceHelperFindChildIdx(p_page, p_parent);
+
+  // Check for file corruption
+  bool discovered_file_corruption = (idx < 0);
+  if (discovered_file_corruption) {
+    return ResultCode::kCorrupt;
+  }
+
+  // Step 5-7: Collect divider pages, cells, and prepare for redistribution
+  BalanceContext context;
+  rc = InitializeBalanceContext(context, p_page, p_parent, p_cursor, idx, true);
+  if (rc != ResultCode::kOk) {
+    goto balance_cleanup;
+  }
+
+  // Step 8-9: Calculate and distribute cell sizes for the new pages
+  CalculateNewPageDistribution(context);
+
+  // Step 10: Allocate new pages for the cells
+  rc = AllocateNewPages(context, true);
+  if (rc != ResultCode::kOk) {
+    goto balance_cleanup;
+  }
+
+  // Step 11: Sort the new pages by page number
+  SortNewPagesByNumber(context);
+
+  // Step 12: Insert the cells into the new pages and update the cursor
+  rc = RedistributeCells(context, p_cursor, true);
+  if (rc != ResultCode::kOk) {
+    goto balance_cleanup;
+  }
+
+  // Step 13: Re-parent the child pages
+  ReParentAllPages(context);
+
+  // Step 14: Call Balance on the parent page
+  rc = Balance(p_parent, p_cursor);
+
+  // Step 15: Cleanup
+balance_cleanup:
+  CleanupBalanceOperation(context, p_extra_unref, p_parent, p_cursor);
+  return rc;
+}
+
+/**
+ * Balance a B-tree node, ensuring proper distribution of cells.
+ * This is the main entry point for the balancing operation.
  *
  * @param p_page: pointer to the current page we are balancing
- * @param p_cursor: cursor attached to the balance operation, it has to be
- * passed to the function because the key-data pair that the cursor is pointing
- * to may be relocated to a different page and even have a different index on
- * that page. Therefore, we keep the p_cursor around to update during the
- * balancing process.
+ * @param p_cursor: cursor attached to the balance operation
  * @return: appropriate result code
  */
 ResultCode Btree::Balance(NodePage *p_page,
@@ -31,13 +156,8 @@ ResultCode Btree::Balance(NodePage *p_page,
   }
 
   // Step 2: Check if the page needs any balancing at all
-  // Every database system will have its own definition on when to balance.
-  // The logic below is what CapybaraDB uses to determine if a page needs
-  // balancing.
-  if (!p_page->IsOverfull() && p_page->num_free_bytes_ < kPageSize / 2 &&
-      p_page->GetNumCells() >= 2) {
-    p_page->RelinkCellList(); // Make sure the cells are linked properly in the
-                              // page image.
+  if (IsBalancing(p_page)) {
+    p_page->RelinkCellList(); // Make sure the cells are linked properly
     return ResultCode::kOk;
   }
 
@@ -45,23 +165,11 @@ ResultCode Btree::Balance(NodePage *p_page,
   NodePage *p_parent = p_page->p_parent_;
   BasePage *p_base_page = nullptr;
   NodePage *p_extra_unref = nullptr;
-  CellHeaderByteView cell_header{};
-  std::vector<NodePageHeaderByteView> divider_page_headers{};
 
-  // Step 3: Check if the current is the root page
-  // The root page is very special since every Btree is identified through the
-  // root page number. Every table, index you inside the database is tracked If
-  // it is a root page, we will apply special logic to balance it
+  // Step 3: Handle the special case of root page
   if (!p_parent) {
     bool return_ok_early = false;
-    // TODO: A3 -> Call helper function here to handle the root page
-    // TODO: Your code here
-    // CHAOS: Assume the tree has 2 levels to begin with (?)
     rc = BalanceHelperHandleRoot(p_page, p_parent, p_cursor, p_extra_unref, return_ok_early);
-
-
-    // ------------------------------------
-
     if (rc != ResultCode::kOk) {
       return rc;
     }
@@ -75,492 +183,530 @@ ResultCode Btree::Balance(NodePage *p_page,
     return rc;
   }
 
-  // Step 4: Find the index of the cell in the parent that points to the current
-  // page
-  int idx; // The index of the cell in the parent that points to the current
-           // page
-
-  // TODO: A3 -> Call helper function to find the parent cell idx that points to
-  // the current page
-  // TODO: Your code here
-
-  idx = BalanceHelperFindChildIdx(p_page, p_parent);
-
-  // ------------------------------------
-
-  // TODO: A3 -> Assign the correct value to discovered_file_corruption
-  // according to the value of idx. Hint: Inspect the logic of
-  // BalanceHelperFindChildIdx to determine what it returns when it cannot find
-  // the index of the cell in the parent that points to the current page.
-  // ------------------------------------
-  // TODO: Your code here
-  bool discovered_file_corruption;
-
-  discovered_file_corruption = (idx < 0);
-
-  if (discovered_file_corruption) {
-    return ResultCode::kCorrupt;
-  }
-
-  /*
-   * In the following section, we will store p_page and 2 of its siblings in
-   * divider_pages. Divider pages are pages where we will remove its cells and
-   * redistribute them to new pages.
-   *
-   * The cells that are associated with these pages will be known as divider
-   * cells. Note that there might be 1 more divider page than divider cell
-   * because the right child page number is not associated with a cell.
-   *
-   * We have already found the index of the cell in p_parent that points to
-   * p_page in step 4. Using this information, we can inspect the cell headers
-   * to the left and right or idx and find the siblings. Ideally, we want a
-   * sibling from the left and right of p_page. However, we might end up with 2
-   * siblings the right child is chosen in the case of idx ==
-   * p_parent->GetNumCells().
-   *
-   * In the case of that p_parent has 3 or fewer children, all of p_parents'
-   * children will be stored in divider_pages.
-   */
-
-  // Some containers to store info about the pages and cells we want to divide
-
-  std::vector<NodePage *>
-      divider_pages{}; // Stores the pages we will need to divide
-  std::vector<u16> num_cells_in_divider_pages{}; // Stores the number of cells
-                                                 // in the divider pages
-  std::vector<PageNumber>
-      divider_page_numbers{}; // Stores the page number associated with the
-                              // divider pages
-  std::vector<u16>
-      divider_cell_indexes{};        // Stores the indexes of the divider cells
-                                     // associated with the page numbers
-  std::vector<Cell> divider_cells{}; // Stores the divider cells
-  std::vector<Cell> redistributed_cells{}; // Stores the cells that will be
-                                           // redistributed to the new pages
-  std::vector<u16> new_divider_cell_indexes;
-
-  // Here are some variables we initialize due to using goto
-  // ----------------
-  u16 cursor_cell_index;
-  std::vector<std::unique_ptr<NodePage>> divider_page_copies{};
-  std::vector<u32> redistributed_cell_sizes{};
-  u32 num_cells_inserted;
-  u32 subtotal;
-  std::vector<u32> new_combined_cell_sizes{};
-  std::vector<u16> first_indexes_of_next_page{};
-  std::vector<std::pair<PageNumber, NodePage *>> new_page_number_to_page{};
-  NodePageHeaderByteView page_header{};
-  PageNumber final_right_child = 0;
-  // ---------
-
-  pager_->SqlitePagerRef(p_parent);
-
-  // Step 4: Find which pages are the divider pages
-  // These are the pages that will have their cells redistributed to new pages
-  int divider_start_cell_idx;
-  if (idx == (int)p_parent->GetNumCells()) {
-    // In case if idx is the right child, set the start to the 2nd to last cell
-    // When iterating through 3 cells, the right child will be the final cell
-    divider_start_cell_idx = idx - 2;
+  // Check if Node page is leaf or internal
+  if (p_page->IsInternalNode()) {
+    rc = BalanceInternalNode(p_page, p_cursor);
   } else {
-    // In case if idx is not the right child, set the start to the cell to the
-    // left of idx When iterating through 3 cells, idx will be in the middle
-    divider_start_cell_idx = idx - 1;
+    rc = BalanceLeafNode(p_page, p_cursor);
   }
-  if (divider_start_cell_idx < 0) {
-    divider_start_cell_idx = 0;
+  return rc;
+}
+
+/**
+ * Check if balancing is required for the given page.
+ *
+ * @param p_page: the page to check
+ * @return: true if balancing is not required, false otherwise
+ */
+bool Btree::IsBalancing(NodePage *p_page) {
+  return !p_page->IsOverfull() &&
+         p_page->num_free_bytes_ < kPageSize / 2 &&
+         p_page->GetNumCells() >= 2;
+}
+
+/**
+ * Initialize the balance context with all necessary information.
+ *
+ * @param context: the balance context to initialize
+ * @param p_page: the current page being balanced
+ * @param p_parent: the parent page
+ * @param p_cursor: the cursor attached to the balance operation
+ * @param idx: the index of the cell in the parent that points to p_page
+ * @return: appropriate result code
+ */
+ResultCode Btree::InitializeBalanceContext(BalanceContext &context,
+                                          NodePage *p_page,
+                                          NodePage *p_parent,
+                                          const std::weak_ptr<BtCursor> &p_cursor,
+                                          int idx, bool isInternal) {
+  context.p_parent = p_parent;
+  ResultCode rc;
+  BasePage *p_base_page = nullptr;
+  std::vector<NodePageHeaderByteView> divider_page_headers;
+
+  // Calculate divider start cell index
+  int num_cells_in_parent = (int)p_parent->GetNumCells();
+  if (idx == num_cells_in_parent) {
+    context.divider_start_cell_idx = idx - 2;
+  } else {
+    context.divider_start_cell_idx = idx - 1;
+  }
+  if (context.divider_start_cell_idx < 0) {
+    context.divider_start_cell_idx = 0;
   }
 
+  // Collect divider pages, cells, and cell indexes
+  rc = CollectDividerPages(context, p_parent, divider_page_headers);
+  if (rc != ResultCode::kOk) {
+    return rc;
+  }
+
+  // Track cursor position
+  rc = TrackCursorPosition(context, p_cursor, isInternal);
+  if (rc != ResultCode::kOk) {
+    return rc;
+  }
+
+  // Collect all cells for redistribution
+  rc = CollectCellsForRedistribution(context, p_parent, divider_page_headers,
+                                     isInternal);
+  if (rc != ResultCode::kOk) {
+    return rc;
+  }
+
+  return ResultCode::kOk;
+}
+
+/**
+ * Collect divider pages from the parent node.
+ *
+ * @param context: the balance context
+ * @param p_parent: the parent page
+ * @param divider_page_headers: container for page headers
+ * @return: appropriate result code
+ */
+ResultCode Btree::CollectDividerPages(BalanceContext &context,
+                                     NodePage *p_parent,
+                                     std::vector<NodePageHeaderByteView> &divider_page_headers) {
+  ResultCode rc;
+  BasePage *p_base_page = nullptr;
   int num_cells_in_parent = (int)p_parent->GetNumCells();
 
-  // Step 5: Store the divider pages, cells, and cell indexes
-  for (int i = 0, k = divider_start_cell_idx; i < 3; ++i, ++k) {
+  for (int i = 0, k = context.divider_start_cell_idx; i < 3; ++i, ++k) {
     if (k < num_cells_in_parent) {
-      // This is the case where the left child is chosen
-      divider_cell_indexes.push_back(k);
-      PageNumber left_child_page_number;
-
-      // TODO: A3 -> Assign the correct value to left_child_page_number
-      // It should be the left child inside the cell header of the cell at index
-      // k. There is a function in node_page.cc that you should call here
-      // TODO: Your code here
-
-      left_child_page_number = p_parent->GetCellHeaderByteView(k).left_child;
-
-      // ------------------------------------
-
-      divider_page_numbers.push_back(left_child_page_number);
-      divider_cells.push_back(p_parent->GetCell(k));
+      // Left child case
+      context.divider_cell_indexes.push_back(k);
+      PageNumber left_child_page_number = p_parent->GetCellHeaderByteView(k).left_child;
+      context.divider_page_numbers.push_back(left_child_page_number);
+      context.divider_cells.push_back(p_parent->GetCell(k));
     } else if (k == num_cells_in_parent) {
-      // This is the case where the right child is chosen
-      // Note that since the right child is not associated with a cell header,
-      // we will not push anything into divider_cell_headers
-
-      PageNumber right_child_page_number;
-
-      // TODO: A3 -> Assign the correct value to right_child_page_number
-      // This value could be found inside the p_parent's node page header
-      // There is a function in node_page.cc that you should call here
-      // TODO: Your code here
-
-      right_child_page_number = p_parent->GetNodePageHeaderByteView().right_child;
-
-      // ------------------------------------
-
-      divider_page_numbers.push_back(right_child_page_number);
+      // Right child case
+      PageNumber right_child_page_number = p_parent->GetNodePageHeaderByteView().right_child;
+      context.divider_page_numbers.push_back(right_child_page_number);
     } else {
       break;
     }
 
-    // Get the page of the sibling and store it in divider_pages
-    rc = pager_->SqlitePagerGet(divider_page_numbers.back(), &p_base_page,
-                                NodePage::CreateDerivedPage);
+    // Get the page and store it in divider_pages
+    rc = pager_->SqlitePagerGet(context.divider_page_numbers.back(), &p_base_page,
+                               NodePage::CreateDerivedPage);
     if (rc != ResultCode::kOk) {
-      goto balance_cleanup;
+      return rc;
     }
+
     auto *p_node_page = dynamic_cast<NodePage *>(p_base_page);
     divider_page_headers.push_back(p_node_page->GetNodePageHeaderByteView());
     rc = InitPage(*p_node_page, p_parent);
     if (rc != ResultCode::kOk) {
-      goto balance_cleanup;
+      return rc;
     }
-    divider_pages.push_back(p_node_page);
+    context.divider_pages.push_back(p_node_page);
   }
 
-  /*
-   * Step 6: Keep track of where the cursor should point to after the balancing
-   * operation
-   *
-   * In the later steps, every cell will be removed and combined into a vector
-   * called redistributed_cells. The cursor keeps track of which cell on which
-   * page it is pointing to. If p_cursor is not expired, we want to make sure
-   * that the cursor points to the same cell.
-   */
-  NodePage *p_old_page;
-  cursor_cell_index = 0;
-  if (!p_cursor.expired()) {
-    auto cursor = *p_cursor.lock();
-    cursor_cell_index = 0;
-    // Iterate through all the divider pages and its cells to find the cursor's
-    // cell index. This value should be between 0 and the size of the
-    // redistributed_cells vector. When redistributing the cells, as we reach
-    // the cell that the cursor is pointing to, we can correctly update the
-    // cursor to point to the new page and cell index
-    for (size_t i = 0; i < divider_page_numbers.size(); ++i) {
-      if (cursor.p_page == divider_pages[i]) {
-        cursor_cell_index += cursor.cell_index;
-        break;
-      }
-      cursor_cell_index += divider_pages[i]->GetNumCells();
-      // Note that BalanceHelperHandleRoot could have made p_page into p_parent
-      // Thus, we need to check for this case
+  return ResultCode::kOk;
+}
 
-      if (i < divider_page_numbers.size() - 1 && cursor.p_page == p_parent &&
-          cursor.cell_index == divider_cell_indexes[i]) {
-        break;
-      }
-      // CHAOS: Add 1 for the cell that contains data in the parent node, this is not needed in b+ tree since parent does not contain data
-      ++cursor_cell_index;
-    }
-    p_old_page = cursor.p_page;
+/**
+ * Track the cursor's position before redistribution.
+ *
+ * @param context: the balance context
+ * @param p_cursor: the cursor attached to the balance operation
+ * @return: appropriate result code
+ */
+ResultCode Btree::TrackCursorPosition(BalanceContext &context,
+                                     const std::weak_ptr<BtCursor> &p_cursor, bool isInternal) {
+  context.cursor_cell_index = 0;
+  if (p_cursor.expired()) {
+    return ResultCode::kOk;
   }
 
-  /*
-   * Step 7: Remove the cells from the divider pages and store them in
-   * redistributed_cells. Also, keep track of the sizes of the cells in
-   * redistributed_cell_sizes. We need these sizes to figure out how many pages
-   * we need to store the redistributed cells
-   */
-  for (size_t i = 0; i < divider_page_numbers.size(); ++i) {
-    num_cells_in_divider_pages.push_back(divider_pages[i]->GetNumCells());
-    for (size_t j = 0; j < divider_pages[i]->GetNumCells(); ++j) {
-      redistributed_cells.push_back(divider_pages[i]->GetCell(j));
-      redistributed_cell_sizes.push_back(
-          redistributed_cells.back().GetCellSize());
+  auto cursor = *p_cursor.lock();
+  // Find the cursor's cell index across all divider pages
+  for (size_t i = 0; i < context.divider_page_numbers.size(); ++i) {
+    if (cursor.p_page == context.divider_pages[i]) {
+      context.cursor_cell_index += cursor.cell_index;
+      break;
     }
-    // E, F
-    if (i < divider_page_numbers.size() - 1) {
-      // CHAOS: This might not be needed for b+ tree
-      redistributed_cells.push_back(divider_cells[i]);
-      redistributed_cells.back().cell_header_.left_child =
-          divider_page_headers[i].right_child;
-      redistributed_cell_sizes.push_back(
-          redistributed_cells.back().GetCellSize());
-      p_parent->DropCell(divider_start_cell_idx);
+    context.cursor_cell_index += context.divider_pages[i]->GetNumCells();
+
+    // Special case: BalanceHelperHandleRoot could have made p_page into p_parent
+    if (i < context.divider_page_numbers.size() - 1 &&
+        cursor.p_page == context.p_parent &&
+        cursor.cell_index == context.divider_cell_indexes[i]) {
+      break;
+    }
+    if (isInternal) {
+      ++context.cursor_cell_index;
+    }
+  }
+
+  return ResultCode::kOk;
+}
+
+/**
+ * Collect all cells from divider pages for redistribution.
+ *
+ * @param context: the balance context
+ * @param p_parent: the parent page
+ * @param divider_page_headers: container of page headers
+ * @return: appropriate result code
+ */
+ResultCode Btree::CollectCellsForRedistribution(BalanceContext &context,
+                                              NodePage *p_parent,
+                                              const std::vector<NodePageHeaderByteView> &divider_page_headers,
+                                              bool isInternal) {
+  ResultCode rc;
+  BasePage *p_base_page = nullptr;
+
+  for (size_t i = 0; i < context.divider_page_numbers.size(); ++i) {
+    context.num_cells_in_divider_pages.push_back(context.divider_pages[i]->GetNumCells());
+
+    // Collect all cells from the page
+    for (size_t j = 0; j < context.divider_pages[i]->GetNumCells(); ++j) {
+      context.redistributed_cells.push_back(context.divider_pages[i]->GetCell(j));
+      context.redistributed_cell_sizes.push_back(
+          context.redistributed_cells.back().GetCellSize());
+    }
+
+    // Handle divider cells between pages
+    if (i < context.divider_page_numbers.size() - 1) {
+      if (isInternal) {
+        // add the parent cell to redistributed cell array
+        context.redistributed_cells.push_back(context.divider_cells[i]);
+        // update the left child ptr of the parent cell
+        context.redistributed_cells.back().cell_header_.left_child =
+            divider_page_headers[i].right_child;
+        // add the parent cell size to redistributed cell size array
+        context.redistributed_cell_sizes.push_back(
+            context.redistributed_cells.back().GetCellSize());
+      }
+      // 存疑
+      p_parent->DropCell(context.divider_start_cell_idx);
     } else {
-      final_right_child = divider_page_headers[i].right_child;
+      context.final_right_child = divider_page_headers[i].right_child;
     }
 
-    // After the cells are removed from the pages, they are no longer needed.
-    // We can add them to the free list
-    p_base_page = divider_pages[i];
+    // Free the page after extracting its cells
+    p_base_page = context.divider_pages[i];
     auto *p_node_page = dynamic_cast<NodePage *>(p_base_page);
     p_node_page->ZeroPage();
 
-    PageNumber page_number_to_free;
-
-    // TODO: A3 -> Assign the correct value to page_number_to_free
-    // We have extracted all cells from the page, so we can free it.
-    // Assign the correct value to page_number_to_free
-    // Where could we find the page number of the page we want to free for
-    // iteration i? That is the value you should assign to page_number_to_free
-    // TODO: Your code here
-
-    page_number_to_free = divider_page_numbers[i];
-
-    // ------------------------------------
-
+    PageNumber page_number_to_free = context.divider_page_numbers[i];
     rc = FreePage(p_base_page, page_number_to_free, false);
     if (rc != ResultCode::kOk) {
       return rc;
     }
   }
 
-  /*
-   * Step 8: Calculate the sizes of the cells in the new pages.
-   * We will redistribute the cells into new pages such that the cells are
-   * balanced. The cells will be balanced such that the total size of the cells
-   * in each page is less than or equal to kUsableSpace
-   */
+  return ResultCode::kOk;
+}
 
-  subtotal = 0;
-  for (u32 i = 0; i < redistributed_cell_sizes.size(); ++i) {
-    u32 cell_size = redistributed_cell_sizes[i];
+/**
+ * Calculate the distribution of cells in the new pages.
+ *
+ * @param context: the balance context
+ */
+void Btree::CalculateNewPageDistribution(BalanceContext &context) {
+  // Calculate initial distribution
+  u32 subtotal = 0;
+  for (u32 i = 0; i < context.redistributed_cell_sizes.size(); ++i) {
+    u32 cell_size = context.redistributed_cell_sizes[i];
     if (subtotal + cell_size > kUsableSpace) {
-      new_combined_cell_sizes.push_back(subtotal);
-      new_divider_cell_indexes.push_back(i);
-      assert(new_combined_cell_sizes.back() <= kUsableSpace);
+      context.new_combined_cell_sizes.push_back(subtotal);
+      context.new_divider_cell_indexes.push_back(i);
+      assert(context.new_combined_cell_sizes.back() <= kUsableSpace);
       subtotal = cell_size;
     } else {
       subtotal += cell_size;
     }
   }
-  new_combined_cell_sizes.push_back(subtotal);
-  assert(new_combined_cell_sizes.back() <= kUsableSpace);
-  new_divider_cell_indexes.push_back(redistributed_cell_sizes.size());
+  context.new_combined_cell_sizes.push_back(subtotal);
+  assert(context.new_combined_cell_sizes.back() <= kUsableSpace);
+  context.new_divider_cell_indexes.push_back(context.redistributed_cell_sizes.size());
 
-  /*
-   * Step 9: Evenly distribute the cell sizes on each page
-   *
-   * In the previous step, we tried to cram as many cells as possible into each
-   * page. This would result in the front pages having most space used up, but
-   * the final page having a lot of free space.
-   *
-   * We can start from the back, and pull some cells from the front pages to the
-   * back pages
-   */
-  for (u32 i = new_combined_cell_sizes.size() - 1; i > 0; --i) {
-    // From the back, pull cells from the front pages to the back pages if
-    // as long as the back page has less than kUsableSpace / 2 bytes of free
-    // space
-    while (new_combined_cell_sizes[i] < kUsableSpace / 2) {
-      new_divider_cell_indexes[i - 1] -= 1;
-      new_combined_cell_sizes[i] +=
-          redistributed_cell_sizes[new_divider_cell_indexes[i - 1]];
-      new_combined_cell_sizes[i - 1] -=
-          redistributed_cell_sizes[new_divider_cell_indexes[i - 1] - 1];
+  // Evenly distribute cells across pages
+  BalancePageDistribution(context);
+}
+
+/**
+ * Balance the distribution of cells across pages.
+ *
+ * @param context: the balance context
+ */
+void Btree::BalancePageDistribution(BalanceContext &context) {
+  // Redistribute cells from front pages to back pages for better balance
+  for (u32 i = context.new_combined_cell_sizes.size() - 1; i > 0; --i) {
+    while (context.new_combined_cell_sizes[i] < kUsableSpace / 2) {
+      context.new_divider_cell_indexes[i - 1] -= 1;
+      context.new_combined_cell_sizes[i] +=
+          context.redistributed_cell_sizes[context.new_divider_cell_indexes[i - 1]];
+      context.new_combined_cell_sizes[i - 1] -=
+          context.redistributed_cell_sizes[context.new_divider_cell_indexes[i - 1] - 1];
     }
   }
 
-  assert(new_combined_cell_sizes[0] > 0);
+  assert(context.new_combined_cell_sizes[0] > 0);
+}
 
-  // Step 10: Allocate new pages for the cells
-  for (u32 i = 0; i < new_combined_cell_sizes.size(); ++i) {
+/**
+ * Allocate new pages for the redistributed cells.
+ *
+ * @param context: the balance context
+ * @return: appropriate result code
+ */
+ResultCode Btree::AllocateNewPages(BalanceContext &context, bool isInternal) {
+  ResultCode rc;
+
+  for (u32 i = 0; i < context.new_combined_cell_sizes.size(); ++i) {
     NodePage *p_new_page = nullptr;
     PageNumber new_page_number{};
 
-    // TODO: A3 -> Call a B-Tree function to allocate a new page for p_new_page.
-    // The page number is stored in the new_page_number variable
-    // TODO: Your code here
-
     rc = AllocatePage(p_new_page, new_page_number);
-
-    // ------------------------------------
-
     if (rc != ResultCode::kOk) {
-      goto balance_cleanup;
+      return rc;
     }
+
     p_new_page->ZeroPage();
     p_new_page->is_init_ = true;
-    new_page_number_to_page.emplace_back(new_page_number, p_new_page);
+    p_new_page->SetNodeType(isInternal);
+    context.new_page_number_to_page.emplace_back(new_page_number, p_new_page);
   }
 
-  /*
-   * Step 11: Sort the new page number and page pairs by page number
-   *
-   *
-   * In many cases, the VDBE layer will iterate through Btree from left to
-   * right. If the pages are not sorted, then Pager will have to jump around the
-   * file to read the pages when we could have read the pages in a linear
-   * fashion. Having the pages sorted can in turn helps the operating system to
-   * deliver pages from the disk more rapidly.
-   */
+  return ResultCode::kOk;
+}
 
-  // TODO: A3 -> Sort the new_page_number_to_page vector by page number
-  // Each element in the vector is a pair of page number and NodePage pointer
-  // TODO: Your code here
+/**
+ * Sort new pages by page number for better disk access patterns.
+ *
+ * @param context: the balance context
+ */
+void Btree::SortNewPagesByNumber(BalanceContext &context) {
+  std::sort(context.new_page_number_to_page.begin(),
+            context.new_page_number_to_page.end(),
+            [](const auto& a, const auto& b) {
+              return a.first < b.first;
+            });
+}
 
-  std::sort(new_page_number_to_page.begin(), new_page_number_to_page.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
+/**
+ * Redistribute cells to the new pages and update the cursor.
+ *
+ * @param context: the balance context
+ * @param p_cursor: the cursor attached to the balance operation
+ * @return: appropriate result code
+ */
+ResultCode Btree::RedistributeCells(BalanceContext &context,
+                                   const std::weak_ptr<BtCursor> &p_cursor, bool isInternal) {
+  NodePage *p_old_page = nullptr;
+  if (!p_cursor.expired()) {
+    p_old_page = p_cursor.lock()->p_page;
+  }
 
-  // ------------------------------------
+  context.num_cells_inserted = 0;
+  for (u32 i = 0; i < context.new_page_number_to_page.size(); ++i) {
+    PageNumber new_page_number = context.new_page_number_to_page[i].first;
+    NodePage *p_new_page = context.new_page_number_to_page[i].second;
 
-  /*
-   * Step 12: Insert the cells into the new pages and update the cursor
-   */
-  num_cells_inserted = 0; // Keep track of how many cells we have inserted
-  for (u32 i = 0; i < new_page_number_to_page.size(); ++i) {
-    PageNumber new_page_number;
-    NodePage *p_new_page;
-
-    // TODO: A3 -> Assign the correct values to new_page_number and p_new_page
-    // for iteration i
-    // TODO: Your code here
-
-    new_page_number = new_page_number_to_page[i].first;
-    p_new_page = new_page_number_to_page[i].second;
-
-    // -----------------------------------
-
-    // 12 - 1: Insert the cells the child pages
-    while (num_cells_inserted < new_divider_cell_indexes[i]) {
-      Cell cell_to_insert = redistributed_cells[num_cells_inserted];
-      // Update the cursor if necessary
-      if (num_cells_inserted == cursor_cell_index && !p_cursor.expired()) {
-        // TODO: A3 -> Assign the correct values to p_page and cell_index inside
-        // p_cursor Assign the correct values to p_page and cell_index inside
-        // p_cursor p_page should point to p_new_page cell_index should be the
-        // number of cells in p_new_page
-        // TODO: Your code here
-
-        p_cursor.lock()->p_page = p_new_page;
-        p_cursor.lock()->cell_index = p_new_page->GetNumCells();
-
-        // -----------------------------------
-      }
-
-      // TODO: A3 -> Insert the cell (cell_to_insert) into the new page
-      // The cell_index should be the number of cells in p_new_page
-      // There is a function in node_page.cc that can help with this
-      // TODO: Your code here
-
-      p_new_page->InsertCell(cell_to_insert, p_new_page->GetNumCells());
-
-      // -----------------------------------
-
-      num_cells_inserted++;
+    // Insert cells into the new page
+    ResultCode rc = InsertCellsIntoNewPage(context, p_new_page, p_cursor, i);
+    if (rc != ResultCode::kOk) {
+      return rc;
     }
-    // 12 - 2: Insert cells into the parent page
-    // CHAOS: When inserting cells into parent page, when we are balancing a leaf node, make sure a copy is saved at the child layer
-    // CHAOS: This is not necessary when balancing internal node with keys
-    if (i < new_page_number_to_page.size() - 1) {
-      page_header = p_new_page->GetNodePageHeaderByteView();
-      page_header.right_child =
-          redistributed_cells[num_cells_inserted].cell_header_.left_child;
-      p_new_page->SetNodePageHeaderByteView(page_header);
-      Cell cell_to_insert = redistributed_cells[num_cells_inserted];
-      cell_to_insert.cell_header_.left_child = new_page_number;
-      if (num_cells_inserted == cursor_cell_index && !p_cursor.expired()) {
 
-        // TODO: A3 -> Assign the correct values to p_page and cell_index inside
-        // p_cursor p_page should point to p_parent cell_index should be
-        // divider_start_cell_idx
-        // TODO: Your code here
-
-        p_cursor.lock()->p_page = p_parent;
-        p_cursor.lock()->cell_index = divider_start_cell_idx;
-
-        // -----------------------------------
+    // Insert cells into parent if needed
+    if (i < context.new_page_number_to_page.size() - 1) {
+      rc = InsertCellsIntoParent(context, p_new_page, new_page_number, p_cursor,
+                                 i, isInternal);
+      if (rc != ResultCode::kOk) {
+        return rc;
       }
-
-      // TODO: A3 -> Insert the cell (cell_to_insert) into the parent page
-      // The cell_index should be divider_start_cell_idx
-      // There should be a function in node_page.cc that can help with this
-      // TODO: Your code here
-
-      p_parent->InsertCell(cell_to_insert, divider_start_cell_idx);
-
-      // -----------------------------------
-
-      num_cells_inserted++;
-      divider_start_cell_idx++;
+    } else { // Handle the last linked list pointer for leaf node only
+      if (!isInternal) {
+        NodePageHeaderByteView page_header = p_new_page->GetNodePageHeaderByteView();
+        page_header.right_child = context.final_right_child;
+        p_new_page->SetNodePageHeaderByteView(page_header);
+      }
     }
   }
 
-  // 12 - 3: Update the right child of the parent properly
-  page_header =
-      new_page_number_to_page.back().second->GetNodePageHeaderByteView();
-  page_header.right_child = final_right_child;
-  new_page_number_to_page.back().second->SetNodePageHeaderByteView(page_header);
-  if (divider_start_cell_idx == p_parent->GetNumCells()) {
-    page_header = p_parent->GetNodePageHeaderByteView();
-    page_header.right_child = new_page_number_to_page.back().first;
-    p_parent->SetNodePageHeaderByteView(page_header);
-  } else {
-    cell_header = p_parent->GetCellHeaderByteView(divider_start_cell_idx);
-    cell_header.left_child = new_page_number_to_page.back().first;
-    p_parent->SetCellHeaderByteView(divider_start_cell_idx, cell_header);
-  }
+  // Update the right child references
+  UpdateRightChildReferences(context);
+
+  // Update cursor if necessary
   if (!p_cursor.expired()) {
     auto cursor = *p_cursor.lock();
-    if (num_cells_inserted <= cursor_cell_index && cursor.p_page == p_parent &&
-        cursor.cell_index > num_cells_in_divider_pages.back()) {
+    if (context.num_cells_inserted <= context.cursor_cell_index &&
+        cursor.p_page == context.p_parent &&
+        cursor.cell_index > context.num_cells_in_divider_pages.back()) {
       cursor.cell_index +=
-          new_page_number_to_page.size() - divider_page_numbers.size();
+          context.new_page_number_to_page.size() - context.divider_page_numbers.size();
     } else {
       pager_->SqlitePagerRef(p_cursor.lock()->p_page);
       pager_->SqlitePagerUnref(p_old_page);
     }
   }
 
-  /*
-   * Step 13: Re-parent the child pages and the parent page
-   *
-   * After the cells are redistributed, into the node pages, we must update the
-   * parent pointers.
-   */
+  return ResultCode::kOk;
+}
 
-  // TODO: A3 -> Call B-Tree function to re-parent child pages on each of the
-  // new pages we created.
-  // The pointer to each page is stored in new_page_number_to_page
-  // TODO: Your code here
+/**
+ * Insert cells into a new page during redistribution.
+ *
+ * @param context: the balance context
+ * @param p_new_page: the new page to insert cells into
+ * @param p_cursor: the cursor attached to the balance operation
+ * @param page_index: the index of the new page
+ * @return: appropriate result code
+ */
+ResultCode Btree::InsertCellsIntoNewPage(BalanceContext &context,
+                                        NodePage *p_new_page,
+                                        const std::weak_ptr<BtCursor> &p_cursor,
+                                        u32 page_index) {
+  while (context.num_cells_inserted < context.new_divider_cell_indexes[page_index]) {
+    Cell cell_to_insert = context.redistributed_cells[context.num_cells_inserted];
 
-  for (auto& page_pair : new_page_number_to_page) {
+    // Update the cursor if necessary
+    if (context.num_cells_inserted == context.cursor_cell_index && !p_cursor.expired()) {
+      p_cursor.lock()->p_page = p_new_page;
+      p_cursor.lock()->cell_index = p_new_page->GetNumCells();
+    }
+
+    // Insert the cell
+    p_new_page->InsertCell(cell_to_insert, p_new_page->GetNumCells());
+    context.num_cells_inserted++;
+  }
+
+  return ResultCode::kOk;
+}
+
+/**
+ * Insert cells into the parent page during redistribution.
+ *
+ * @param context: the balance context
+ * @param p_new_page: the new page
+ * @param new_page_number: the page number of the new page
+ * @param p_cursor: the cursor attached to the balance operation
+ * @param page_index: the index of the new page
+ * @return: appropriate result code
+ */
+ResultCode Btree::InsertCellsIntoParent(BalanceContext &context,
+                                       NodePage *p_new_page,
+                                       PageNumber new_page_number,
+                                       const std::weak_ptr<BtCursor> &p_cursor,
+                                       u32 page_index,
+                                       bool isInternal) {
+  Cell cell_to_insert;
+  if (isInternal) {
+    // Update right child of new page
+    NodePageHeaderByteView page_header = p_new_page->GetNodePageHeaderByteView();
+    page_header.right_child = context.redistributed_cells[context.num_cells_inserted].cell_header_.left_child;
+    p_new_page->SetNodePageHeaderByteView(page_header);
+    cell_to_insert = context.redistributed_cells[context.num_cells_inserted];
+  } else {
+    // CHAOS: handle linked list part at here
+    // Add an empty key cell to the parent
+    const Cell cell_push_to_parent = context.redistributed_cells[context.num_cells_inserted - 1];
+    std::vector<std::byte> key_value(cell_push_to_parent.cell_header_.key_size);
+    std::memcpy(key_value.data(), cell_push_to_parent.payload_.data(), cell_push_to_parent.cell_header_.key_size);
+    cell_to_insert = Cell(key_value);
+
+    // Handle linked list
+    NodePageHeaderByteView page_header = p_new_page->GetNodePageHeaderByteView();
+    PageNumber next_page_number = context.new_page_number_to_page[page_index + 1].first;
+    page_header.right_child = next_page_number;
+    p_new_page->SetNodePageHeaderByteView(page_header);
+  }
+  cell_to_insert.cell_header_.left_child = new_page_number;
+
+  // Update cursor if necessary
+  if (context.num_cells_inserted == context.cursor_cell_index && !p_cursor.expired()) {
+    p_cursor.lock()->p_page = context.p_parent;
+    p_cursor.lock()->cell_index = context.divider_start_cell_idx;
+  }
+
+  // Insert cell into parent
+  context.p_parent->InsertCell(cell_to_insert, context.divider_start_cell_idx);
+
+  if (isInternal) {
+    context.num_cells_inserted++;
+  }
+  context.divider_start_cell_idx++;
+
+  return ResultCode::kOk;
+}
+
+/**
+ * Update right child references after redistribution.
+ *
+ * @param context: the balance context
+ */
+void Btree::UpdateRightChildReferences(BalanceContext &context) {
+  // Update last page's right child
+  NodePageHeaderByteView page_header =
+      context.new_page_number_to_page.back().second->GetNodePageHeaderByteView();
+  page_header.right_child = context.final_right_child;
+  context.new_page_number_to_page.back().second->SetNodePageHeaderByteView(page_header);
+
+  // Update parent's references
+  if (context.divider_start_cell_idx == context.p_parent->GetNumCells()) {
+    // Update parent's right child
+    page_header = context.p_parent->GetNodePageHeaderByteView();
+    page_header.right_child = context.new_page_number_to_page.back().first;
+    context.p_parent->SetNodePageHeaderByteView(page_header);
+  } else {
+    // Update left child of next cell
+    CellHeaderByteView cell_header =
+        context.p_parent->GetCellHeaderByteView(context.divider_start_cell_idx);
+    cell_header.left_child = context.new_page_number_to_page.back().first;
+    context.p_parent->SetCellHeaderByteView(context.divider_start_cell_idx, cell_header);
+  }
+}
+
+/**
+ * Re-parent all child pages after redistribution.
+ *
+ * @param context: the balance context
+ */
+void Btree::ReParentAllPages(BalanceContext &context) {
+  // Re-parent child pages on new pages
+  for (auto& page_pair : context.new_page_number_to_page) {
     ReParentChildPages(*page_pair.second);
   }
 
-  // ------------------------------------
+  // Re-parent child pages on parent
+  ReParentChildPages(*context.p_parent);
+}
 
-  ReParentChildPages(*p_parent);
-
-// Step 14: Call Balance on the parent page
-
-// TODO: A3 -> Call Balance on the parent page
-// TODO: Your code here
-
-  rc = Balance(p_parent, p_cursor);
-
-// ------------------------------------
-
-// Step 15: Cleanup, unreferencing the pages and returning the result code
-balance_cleanup:
+/**
+ * Clean up resources after balancing.
+ *
+ * @param context: the balance context
+ * @param p_extra_unref: extra page to unreference
+ * @param p_parent: the parent page
+ * @param p_cursor: the cursor attached to the balance operation
+ */
+void Btree::CleanupBalanceOperation(BalanceContext &context,
+                                   NodePage *p_extra_unref,
+                                   NodePage *p_parent,
+                                   const std::weak_ptr<BtCursor> &p_cursor) {
   if (p_extra_unref) {
     pager_->SqlitePagerUnref(p_extra_unref);
   }
-  for (auto &page : divider_pages) {
+
+  for (auto &page : context.divider_pages) {
     pager_->SqlitePagerUnref(page);
   }
-  for (auto &page_number_page_pair : new_page_number_to_page) {
+
+  for (auto &page_number_page_pair : context.new_page_number_to_page) {
     pager_->SqlitePagerUnref(page_number_page_pair.second);
   }
+
   if (!p_cursor.expired() && !p_cursor.lock()->p_page) {
     p_cursor.lock()->p_page = p_parent;
     p_cursor.lock()->cell_index = 0;
   } else {
     pager_->SqlitePagerUnref(p_parent);
   }
-
-  return rc;
 }
 
 /**
@@ -702,6 +848,7 @@ Btree::BalanceHelperHandleRoot(NodePage *&p_page, NodePage *&p_parent,
   NodePageHeaderByteView header = p_page->GetNodePageHeaderByteView();
   header.right_child = child_page_number;
   p_page->SetNodePageHeaderByteView(header);
+  p_page->SetNodeType(true);
   // The next part of the balancing function will redistribute the parent's
   // cells into the child pages We can trick the function into thinking that
   // p_page is a parent page

@@ -388,6 +388,7 @@ ResultCode Btree::BtreeLast(const std::weak_ptr<BtCursor> &p_cursor_weak,
  * @param result: reference parameter
  * @return Result code
  */
+// CHAOS: complete but problematic?
 ResultCode Btree::BtreeMoveTo(const std::weak_ptr<BtCursor> &p_cursor_weak,
                               std::vector<std::byte> &key, int &result) {
   // Step 1: Check if the cursor exists, and return error if not
@@ -428,14 +429,21 @@ ResultCode Btree::BtreeMoveTo(const std::weak_ptr<BtCursor> &p_cursor_weak,
       if (rc != ResultCode::kOk) {
         return rc;
       }
+      // found
       if (c == 0) {
-        // key found
         // CHAOS: Need to point the cursor down to leaf node when the key matches
         // force the cursor to the leaf node where it contains
-        result = c;
-        cursor.compare_result = c;
-        return ResultCode::kOk;
-      } else if (c < 0) {
+        // it is a leaf
+        if (!cursor.p_page->IsInternalNode()) {
+          result = c;
+          cursor.compare_result = c;
+          return ResultCode::kOk;
+        }
+        // it is NOT a leaf
+        lower_bound = cursor.cell_index;
+        break;
+      }
+      if (c < 0) {
         // key on the right
         lower_bound = cursor.cell_index + 1;
       } else {
@@ -444,10 +452,87 @@ ResultCode Btree::BtreeMoveTo(const std::weak_ptr<BtCursor> &p_cursor_weak,
       }
     }
     PageNumber child_page_number;
+    // This is an edge case
     if (lower_bound >= cursor.p_page->cell_trackers_.size()) {
       child_page_number =
           cursor.p_page->GetNodePageHeaderByteView().right_child;
     } else {
+      // CHAOS: general case
+      CellHeaderByteView cell_header =
+          cursor.p_page->GetCellHeaderByteView(lower_bound);
+      child_page_number = cell_header.left_child;
+    }
+    if (child_page_number == 0) {
+      result = c;
+      cursor.compare_result = c;
+      break;
+    }
+    rc = MoveToChild(cursor, child_page_number);
+  }
+  return rc;
+}
+
+ResultCode Btree::BtreeMoveToWithStop(const std::weak_ptr<BtCursor> &p_cursor_weak,
+                              std::vector<std::byte> &key, int &result) {
+  // Step 1: Check if the cursor exists, and return error if not
+  if (p_cursor_weak.expired()) {
+    return ResultCode::kError;
+  }
+  auto p_cursor = p_cursor_weak.lock();
+  if (bt_cursor_set_.find(p_cursor) == bt_cursor_set_.end()) {
+    return ResultCode::kError;
+  }
+  auto &cursor = *p_cursor;
+  if (!cursor.p_page) {
+    return ResultCode::kAbort;
+  }
+
+  // Step 2: Move the cursor to the root page
+  ResultCode rc;
+  rc = MoveToRoot(cursor);
+  if (rc != ResultCode::kOk) {
+    return rc;
+  }
+  rc = ResultCode::kOk;
+
+  // Outermost while loop will continue for traversing down the tree
+  while (rc == ResultCode::kOk) {
+
+    // The variables lower_bound and upper_bound have to be signed integers.
+    // This is because upper_bound must be able to become -1
+    // to successfully skip the loop when the page is empty.
+    int lower_bound = 0;
+    int upper_bound = cursor.p_page->cell_trackers_.size() - 1;
+    int c = -1;
+
+    // This is a binary search on the cells in the current node
+    while (lower_bound <= upper_bound) {
+      cursor.cell_index = (lower_bound + upper_bound) / 2;
+      rc = BtreeKeyCompare(p_cursor_weak, key, 0, c);
+      if (rc != ResultCode::kOk) {
+        return rc;
+      }
+      // found
+      if (c == 0) {
+        result = c;
+        cursor.compare_result = c;
+        return ResultCode::kOk;
+      }
+      if (c < 0) {
+        // key on the right
+        lower_bound = cursor.cell_index + 1;
+      } else {
+        // key on the left
+        upper_bound = cursor.cell_index - 1;
+      }
+    }
+    PageNumber child_page_number;
+    // This is an edge case
+    if (lower_bound >= cursor.p_page->cell_trackers_.size()) {
+      child_page_number =
+          cursor.p_page->GetNodePageHeaderByteView().right_child;
+    } else {
+      // CHAOS: general case
       CellHeaderByteView cell_header =
           cursor.p_page->GetCellHeaderByteView(lower_bound);
       child_page_number = cell_header.left_child;
@@ -485,7 +570,7 @@ ResultCode Btree::BtreeNext(const std::weak_ptr<BtCursor> &p_cursor_weak,
   if (cursor.cell_index >= cursor.p_page->GetNumCells()) {
     PageNumber right_child =
         cursor.p_page->GetNodePageHeaderByteView().right_child;
-    if (right_child != 0) {
+    if (right_child != 0 && cursor.p_page->IsInternalNode()) {
       rc = MoveToChild(cursor, right_child);
       if (rc != ResultCode::kOk) {
         return rc;
@@ -512,6 +597,35 @@ ResultCode Btree::BtreeNext(const std::weak_ptr<BtCursor> &p_cursor_weak,
   }
   already_at_last_entry = false;
   return ResultCode::kOk;
+}
+
+ResultCode Btree::BTreePrev(const std::weak_ptr<BtCursor> &p_cursor_weak) {
+  if (p_cursor_weak.expired()) {
+    return ResultCode::kError;
+  }
+  auto p_cursor = p_cursor_weak.lock();
+  if (bt_cursor_set_.find(p_cursor) == bt_cursor_set_.end()) {
+    return ResultCode::kError;
+  }
+  auto &cursor = *p_cursor;
+  if (!cursor.p_page) {
+    return ResultCode::kAbort;
+  }
+
+  PageNumber left_page_number = cursor.p_page->GetCell(cursor.cell_index).cell_header_.left_child;
+  BasePage *p_base_page = nullptr;
+  ResultCode rc = pager_->SqlitePagerGet(left_page_number, &p_base_page, NodePage::CreateDerivedPage);
+  if (rc != ResultCode::kOk) {
+    return rc;
+  }
+  auto *left_child_page = dynamic_cast<NodePage *>(p_base_page);
+  if (left_child_page == nullptr) {
+    return ResultCode::kError;
+  }
+  cursor.p_page = left_child_page;
+  cursor.cell_index = cursor.p_page->GetNumCells() - 1;
+  return ResultCode::kOk;
+
 }
 
 /**
@@ -578,7 +692,7 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
   // TODO: A3 -> Call A B-Tree function to fill in the overflow pages for the
   // cell if necessary. There is a function in B-Tree that does it.
   // TODO: Your code here
-  // CHAOS
+  // CHAOS: 存疑，应该不用改
   rc = FillInCell(new_cell);
 
   if (rc != ResultCode::kOk) {
@@ -588,12 +702,12 @@ ResultCode Btree::BtreeInsert(const std::weak_ptr<BtCursor> &p_cursor_weak,
 
   // Step 4: Prepare the page for insertion
   if (local_compare_result == 0) {
-    // Case 1: There is a key-data pair inside this page that matches the given
-    // key Clear the cell inside this page so that we can replace it by
-    // inserting it again
-    // CHAOS: NO need for left child b+ tree, maybe in balance for internal nodes
-    new_cell.cell_header_.left_child =
-        cursor.p_page->GetCellHeaderByteView(cursor.cell_index).left_child;
+    // Case 1: There is a key-data pair inside this page that matches the give key
+    //         Clear the cell inside this page so that we can replace it and insert it again
+    // CHAOS: complete
+
+    // new_cell.cell_header_.left_child =
+    //     cursor.p_page->GetCellHeaderByteView(cursor.cell_index).left_child;
 
     // TODO: A3 -> Clear the payload inside the overflow page for this cell and
     // drop the cell from the page.
@@ -692,6 +806,10 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
     return rc;
   }
   // ----------------------------------------
+  // Save the key value for finding internal cursor in B+ tree
+  Cell current_cell_delete = cursor.p_page->GetCell(cursor.cell_index);
+  std::vector<std::byte> target_key_value(current_cell_delete.cell_header_.key_size);
+  std::memcpy(target_key_value.data(), current_cell_delete.payload_.data(), current_cell_delete.cell_header_.key_size);
 
   // Step 2: Find the child page number
   // CHAOS: Maybe not necessary for b+ treee
@@ -723,6 +841,12 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
   // Step 4: Handle cases for internal and leaf node deletion
   // CHAOS: Maybe will not be considered for b+ tree
   if (child_page_number != 0) {
+    BasePage *p_base_page = nullptr;
+    ResultCode rc = pager_->SqlitePagerGet(child_page_number, &p_base_page, NodePage::CreateDerivedPage);
+    if (rc != ResultCode::kOk) {
+      return rc;
+    }
+    auto *child_page = dynamic_cast<NodePage *>(p_base_page);
     // Case 1: We are deleting an entry in an internal page
     // You won't need to worry about this part for the assignment.
 
@@ -733,38 +857,78 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
     bool already_at_last_entry;
     bt_cursor_set_.insert(p_leaf_cursor);
 
-    // Return early if BtreeNext fails
-    rc = BtreeNext(p_leaf_cursor_weak, already_at_last_entry);
-    if (rc != ResultCode::kOk) {
-      bt_cursor_set_.erase(p_leaf_cursor);
-      return rc;
-    }
-    // Return early if SqlitePagerWrite fails
-    rc = pager_->SqlitePagerWrite(p_leaf_cursor->p_page);
-    if (rc != ResultCode::kOk) {
-      bt_cursor_set_.erase(p_leaf_cursor);
-      return rc;
-    }
+    if (child_page->IsInternalNode()) {
 
-    // Insert a cell, balance it, and then drop the cell
-    cursor.p_page->DropCell(cursor.cell_index);
-    Cell next_cell = p_leaf_cursor->p_page->GetCell(p_leaf_cursor->cell_index);
-    next_cell.cell_header_.left_child = child_page_number;
-    p_cursor->p_page->InsertCell(next_cell, p_cursor->cell_index);
-    rc = Balance(p_cursor->p_page, p_cursor_weak);
-    if (rc != ResultCode::kOk) {
+      // Return early if BtreeNext fails
+      rc = BtreeNext(p_leaf_cursor_weak, already_at_last_entry);
+      if (rc != ResultCode::kOk) {
+        bt_cursor_set_.erase(p_leaf_cursor);
+        return rc;
+      }
+      // Return early if SqlitePagerWrite fails
+      rc = pager_->SqlitePagerWrite(p_leaf_cursor->p_page);
+      if (rc != ResultCode::kOk) {
+        bt_cursor_set_.erase(p_leaf_cursor);
+        return rc;
+      }
+
+      // Insert a cell, balance it, and then drop the cell
+      cursor.p_page->DropCell(cursor.cell_index);
+      Cell next_cell = p_leaf_cursor->p_page->GetCell(p_leaf_cursor->cell_index);
+      next_cell.cell_header_.left_child = child_page_number;
+      p_cursor->p_page->InsertCell(next_cell, p_cursor->cell_index);
+      rc = Balance(p_cursor->p_page, p_cursor_weak);
+      if (rc != ResultCode::kOk) {
+        bt_cursor_set_.erase(p_leaf_cursor);
+        return rc;
+      }
+      p_cursor->skip_next = true;
+      p_leaf_cursor->p_page->DropCell(p_leaf_cursor->cell_index);
+      rc = Balance(p_cursor->p_page, p_cursor_weak);
+      if (rc != ResultCode::kOk) {
+        bt_cursor_set_.erase(p_leaf_cursor);
+        return rc;
+      }
+      ReleaseTempCursor(*p_leaf_cursor);
       bt_cursor_set_.erase(p_leaf_cursor);
-      return rc;
-    }
-    p_cursor->skip_next = true;
-    p_leaf_cursor->p_page->DropCell(p_leaf_cursor->cell_index);
-    rc = Balance(p_cursor->p_page, p_cursor_weak);
-    if (rc != ResultCode::kOk) {
+    } else {
+      rc = BTreePrev(p_leaf_cursor_weak);
+      if (rc != ResultCode::kOk) {
+        bt_cursor_set_.erase(p_leaf_cursor);
+        return rc;
+      }
+      // Return early if SqlitePagerWrite fails
+      rc = pager_->SqlitePagerWrite(p_leaf_cursor->p_page);
+      if (rc != ResultCode::kOk) {
+        bt_cursor_set_.erase(p_leaf_cursor);
+        return rc;
+      }
+
+      // Insert a cell, balance it, and then drop the cell
+      cursor.p_page->DropCell(cursor.cell_index);
+      Cell cell_push_to_parent = p_leaf_cursor->p_page->GetCell(p_leaf_cursor->cell_index);
+
+      std::vector<std::byte> key_value(cell_push_to_parent.cell_header_.key_size);
+      std::memcpy(key_value.data(), cell_push_to_parent.payload_.data(), cell_push_to_parent.cell_header_.key_size);
+      Cell next_cell = Cell(key_value);
+
+      next_cell.cell_header_.left_child = child_page_number;
+      p_cursor->p_page->InsertCell(next_cell, p_cursor->cell_index);
+      rc = Balance(p_cursor->p_page, p_cursor_weak);
+      if (rc != ResultCode::kOk) {
+        bt_cursor_set_.erase(p_leaf_cursor);
+        return rc;
+      }
+      // p_cursor->skip_next = true;
+      // p_leaf_cursor->p_page->DropCell(p_leaf_cursor->cell_index);
+      rc = Balance(p_cursor->p_page, p_cursor_weak);
+      if (rc != ResultCode::kOk) {
+        bt_cursor_set_.erase(p_leaf_cursor);
+        return rc;
+      }
+      ReleaseTempCursor(*p_leaf_cursor);
       bt_cursor_set_.erase(p_leaf_cursor);
-      return rc;
     }
-    ReleaseTempCursor(*p_leaf_cursor);
-    bt_cursor_set_.erase(p_leaf_cursor);
   } else {
     // Case 2: We are deleting an entry in a leaf page
 
@@ -794,6 +958,14 @@ ResultCode Btree::BtreeDelete(const std::weak_ptr<BtCursor> &p_cursor_weak) {
     // TODO: Your code here
 
     rc = Balance(cursor.p_page, p_cursor_weak);
+
+    // Stop the cursor at the internal node with target key value, if the node still exist after balance
+    BtreeMoveToWithStop(p_cursor_weak, target_key_value, cursor.compare_result);
+
+    if (cursor.compare_result == 0) { // HIT
+      BtreeDelete(p_cursor_weak);
+    }
+
 
     // ----------------------------------------
   }

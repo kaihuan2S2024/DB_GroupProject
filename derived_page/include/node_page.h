@@ -20,7 +20,7 @@
 struct NodePageHeaderByteView {
   // The right child page number when the page is treated as an internal node in
   // a Btree.
-  PageNumber right_child;
+  PageNumber right_child; // if node is leaf, this is next ptr
 
   // The first cell starts at this index
   ImageIndex first_cell_idx;
@@ -28,6 +28,9 @@ struct NodePageHeaderByteView {
   // The first free block starts at this index. Set to 0 if there are no free
   // blocks.
   ImageIndex first_free_block_idx;
+
+  // CHAOS: (CHANGE) true if this is an internal node, false if it's a leaf node
+  bool is_internal_;
 };
 
 /*
@@ -158,6 +161,7 @@ class Cell {
   // ######### Public Functions ########
  public:
   Cell();
+  Cell(const std::vector<std::byte> &key_in);
   Cell(const std::vector<std::byte> &key_in,
        const std::vector<std::byte> &data_in);
   Cell(const CellHeaderByteView &cell_header_in,
@@ -302,6 +306,50 @@ class NodePage : public OverFreePage {
   void InsertCell(Cell &cell_in, u16 cell_idx);
   void FreeSpace(ImageIndex free_start_idx, u16 num_bytes_to_free);
   void RelinkCellList();
+
+  /** CHAOS: (CHANGE)
+ * Checks if this node is an internal node
+ * @return true if this is an internal node, false if it's a leaf node
+ */
+  bool IsInternalNode() const {
+    return GetNodePageHeaderByteView().is_internal_;
+  }
+
+  /** CHAOS: (CHANGE)
+   * Sets the node type (internal or leaf)
+   * @param is_internal true if this should be an internal node, false for leaf node
+   */
+  void SetNodeType(bool is_internal) {
+    NodePageHeaderByteView header = GetNodePageHeaderByteView();
+    header.is_internal_ = is_internal;
+    SetNodePageHeaderByteView(header);
+  }
+
+  /** CHAOS: (CHANGE)
+   * Gets the next leaf node (only valid for leaf nodes)
+   * For leaf nodes, right_child is used as next_leaf pointer
+   * @return page number of the next leaf node
+   */
+  PageNumber GetNextLeaf() const {
+    if (IsInternalNode()) {
+      return 0; // Not valid for internal nodes
+    }
+    return GetNodePageHeaderByteView().right_child;
+  }
+
+  /** CHAOS: (CHANGE)
+   * Sets the next leaf node (only for leaf nodes)
+   * For leaf nodes, right_child is used as next_leaf pointer
+   * @param next_leaf_page_number page number of the next leaf node
+   */
+  void SetNextLeaf(PageNumber next_leaf_page_number) {
+    if (IsInternalNode()) {
+      return; // Not valid for internal nodes
+    }
+    NodePageHeaderByteView header = GetNodePageHeaderByteView();
+    header.right_child = next_leaf_page_number;
+    SetNodePageHeaderByteView(header);
+  }
 
   // Public functions for inspecting the NodePage and its page image
 

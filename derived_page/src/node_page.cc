@@ -7,6 +7,18 @@
 Cell::Cell() : cell_header_({0, 0, 0, 0, 0}) {}
 
 /**
+ * Constructor for internal node
+ * @param key_in Input key of the internal node
+ */
+Cell::Cell(const std::vector<std::byte> &key_in) :
+  cell_header_({0, static_cast<u32>(key_in.size()),
+                    0, 0, 0}) {
+  payload_.reserve(cell_header_.key_size);
+  payload_.insert(payload_.end(), key_in.begin(), key_in.end());
+}
+
+
+/**
  * Constructor with key and data parameters.
  */
 Cell::Cell(const std::vector<std::byte> &key_in,
@@ -62,7 +74,7 @@ CellTracker::CellTracker() : image_idx(0), cell(Cell()) {}
 bool CellTracker::IsCellWrittenIntoImage() const { return image_idx != 0; }
 
 /**
- * Default constructor
+ * CHAOS: (CHANGE) Default constructor
  */
 NodePage::NodePage()
     : is_init_(false),
@@ -174,7 +186,7 @@ void NodePage::SetCellHeaderByteViewByImageIndex(
 }
 
 /**
- * Resets the content of the page image and other member variables
+ * CHAOS: (CHANGE) Resets the content of the page image and other member variables
  */
 void NodePage::ZeroPage() {
   memset(p_image_->data(), 0, kPageSize);
@@ -184,6 +196,8 @@ void NodePage::ZeroPage() {
   node_page_header.right_child = 0;
   node_page_header.first_cell_idx = 0;
   node_page_header.first_free_block_idx = sizeof(NodePageHeaderByteView);
+  // CHAOS: change here
+  node_page_header.is_internal_ = false;
   SetNodePageHeaderByteView(node_page_header);
 
   // Step 2: Reset the first free block in the page
